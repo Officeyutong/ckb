@@ -133,6 +133,30 @@ union RelayMessage {
     BlockTransactions,
     GetBlockProposal,
     BlockProposal,
+    RelayTransactionSalt,
+    GetRelayTransactionSketch,
+    RelayTransactionSketch,
+    GetRelayTransactionExtendedSketch,
+    RelayTransactionSketchResult,
+}
+
+table RelayTransactionSalt {
+    salt:      Uint64,
+}
+
+table GetRelayTransactionSketch {
+    set_size:    Uint64,
+    q:           Uint64,
+}
+table RelayTransactionSketch {
+    short_id_sketch:                  Byte32Vec,
+}
+table GetRelayTransactionExtendedSketch {
+    
+}
+table RelayTransactionSketchResult {
+    success:                Bool,
+    missing_short_ids:      Byte32Vec,
 }
 
 table CompactBlock {
