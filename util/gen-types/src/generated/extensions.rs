@@ -7390,6 +7390,7 @@ impl ::core::fmt::Display for RelayTransactionSketch {
         write!(f, "{} {{ ", Self::NAME)?;
         write!(f, "{}: {}", "short_id_sketch", self.short_id_sketch())?;
         write!(f, ", {}: {}", "sketch_size", self.sketch_size())?;
+        write!(f, ", {}: {}", "set_size", self.set_size())?;
         let extra_count = self.count_extra_fields();
         if extra_count != 0 {
             write!(f, ", .. ({} fields)", extra_count)?;
@@ -7404,10 +7405,10 @@ impl ::core::default::Default for RelayTransactionSketch {
     }
 }
 impl RelayTransactionSketch {
-    const DEFAULT_VALUE: [u8; 20] = [
-        20, 0, 0, 0, 12, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    const DEFAULT_VALUE: [u8; 28] = [
+        28, 0, 0, 0, 16, 0, 0, 0, 20, 0, 0, 0, 24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
-    pub const FIELD_COUNT: usize = 2;
+    pub const FIELD_COUNT: usize = 3;
     pub fn total_size(&self) -> usize {
         molecule::unpack_number(self.as_slice()) as usize
     }
@@ -7433,8 +7434,14 @@ impl RelayTransactionSketch {
     pub fn sketch_size(&self) -> Uint32 {
         let slice = self.as_slice();
         let start = molecule::unpack_number(&slice[8..]) as usize;
+        let end = molecule::unpack_number(&slice[12..]) as usize;
+        Uint32::new_unchecked(self.0.slice(start..end))
+    }
+    pub fn set_size(&self) -> Uint32 {
+        let slice = self.as_slice();
+        let start = molecule::unpack_number(&slice[12..]) as usize;
         if self.has_extra_fields() {
-            let end = molecule::unpack_number(&slice[12..]) as usize;
+            let end = molecule::unpack_number(&slice[16..]) as usize;
             Uint32::new_unchecked(self.0.slice(start..end))
         } else {
             Uint32::new_unchecked(self.0.slice(start..))
@@ -7469,6 +7476,7 @@ impl molecule::prelude::Entity for RelayTransactionSketch {
         Self::new_builder()
             .short_id_sketch(self.short_id_sketch())
             .sketch_size(self.sketch_size())
+            .set_size(self.set_size())
     }
 }
 #[derive(Clone, Copy)]
@@ -7492,6 +7500,7 @@ impl<'r> ::core::fmt::Display for RelayTransactionSketchReader<'r> {
         write!(f, "{} {{ ", Self::NAME)?;
         write!(f, "{}: {}", "short_id_sketch", self.short_id_sketch())?;
         write!(f, ", {}: {}", "sketch_size", self.sketch_size())?;
+        write!(f, ", {}: {}", "set_size", self.set_size())?;
         let extra_count = self.count_extra_fields();
         if extra_count != 0 {
             write!(f, ", .. ({} fields)", extra_count)?;
@@ -7500,7 +7509,7 @@ impl<'r> ::core::fmt::Display for RelayTransactionSketchReader<'r> {
     }
 }
 impl<'r> RelayTransactionSketchReader<'r> {
-    pub const FIELD_COUNT: usize = 2;
+    pub const FIELD_COUNT: usize = 3;
     pub fn total_size(&self) -> usize {
         molecule::unpack_number(self.as_slice()) as usize
     }
@@ -7526,8 +7535,14 @@ impl<'r> RelayTransactionSketchReader<'r> {
     pub fn sketch_size(&self) -> Uint32Reader<'r> {
         let slice = self.as_slice();
         let start = molecule::unpack_number(&slice[8..]) as usize;
+        let end = molecule::unpack_number(&slice[12..]) as usize;
+        Uint32Reader::new_unchecked(&self.as_slice()[start..end])
+    }
+    pub fn set_size(&self) -> Uint32Reader<'r> {
+        let slice = self.as_slice();
+        let start = molecule::unpack_number(&slice[12..]) as usize;
         if self.has_extra_fields() {
-            let end = molecule::unpack_number(&slice[12..]) as usize;
+            let end = molecule::unpack_number(&slice[16..]) as usize;
             Uint32Reader::new_unchecked(&self.as_slice()[start..end])
         } else {
             Uint32Reader::new_unchecked(&self.as_slice()[start..])
@@ -7582,6 +7597,7 @@ impl<'r> molecule::prelude::Reader<'r> for RelayTransactionSketchReader<'r> {
         }
         BytesReader::verify(&slice[offsets[0]..offsets[1]], compatible)?;
         Uint32Reader::verify(&slice[offsets[1]..offsets[2]], compatible)?;
+        Uint32Reader::verify(&slice[offsets[2]..offsets[3]], compatible)?;
         Ok(())
     }
 }
@@ -7589,15 +7605,20 @@ impl<'r> molecule::prelude::Reader<'r> for RelayTransactionSketchReader<'r> {
 pub struct RelayTransactionSketchBuilder {
     pub(crate) short_id_sketch: Bytes,
     pub(crate) sketch_size: Uint32,
+    pub(crate) set_size: Uint32,
 }
 impl RelayTransactionSketchBuilder {
-    pub const FIELD_COUNT: usize = 2;
+    pub const FIELD_COUNT: usize = 3;
     pub fn short_id_sketch(mut self, v: Bytes) -> Self {
         self.short_id_sketch = v;
         self
     }
     pub fn sketch_size(mut self, v: Uint32) -> Self {
         self.sketch_size = v;
+        self
+    }
+    pub fn set_size(mut self, v: Uint32) -> Self {
+        self.set_size = v;
         self
     }
 }
@@ -7608,6 +7629,7 @@ impl molecule::prelude::Builder for RelayTransactionSketchBuilder {
         molecule::NUMBER_SIZE * (Self::FIELD_COUNT + 1)
             + self.short_id_sketch.as_slice().len()
             + self.sketch_size.as_slice().len()
+            + self.set_size.as_slice().len()
     }
     fn write<W: molecule::io::Write>(&self, writer: &mut W) -> molecule::io::Result<()> {
         let mut total_size = molecule::NUMBER_SIZE * (Self::FIELD_COUNT + 1);
@@ -7616,12 +7638,15 @@ impl molecule::prelude::Builder for RelayTransactionSketchBuilder {
         total_size += self.short_id_sketch.as_slice().len();
         offsets.push(total_size);
         total_size += self.sketch_size.as_slice().len();
+        offsets.push(total_size);
+        total_size += self.set_size.as_slice().len();
         writer.write_all(&molecule::pack_number(total_size as molecule::Number))?;
         for offset in offsets.into_iter() {
             writer.write_all(&molecule::pack_number(offset as molecule::Number))?;
         }
         writer.write_all(self.short_id_sketch.as_slice())?;
         writer.write_all(self.sketch_size.as_slice())?;
+        writer.write_all(self.set_size.as_slice())?;
         Ok(())
     }
     fn build(&self) -> Self::Entity {
