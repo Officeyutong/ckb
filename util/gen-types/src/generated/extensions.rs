@@ -7839,14 +7839,14 @@ impl RelayTransactionSketchResult {
         let end = molecule::unpack_number(&slice[8..]) as usize;
         Bool::new_unchecked(self.0.slice(start..end))
     }
-    pub fn missing_short_ids(&self) -> Byte32Vec {
+    pub fn missing_short_ids(&self) -> Uint32Vec {
         let slice = self.as_slice();
         let start = molecule::unpack_number(&slice[8..]) as usize;
         if self.has_extra_fields() {
             let end = molecule::unpack_number(&slice[12..]) as usize;
-            Byte32Vec::new_unchecked(self.0.slice(start..end))
+            Uint32Vec::new_unchecked(self.0.slice(start..end))
         } else {
-            Byte32Vec::new_unchecked(self.0.slice(start..))
+            Uint32Vec::new_unchecked(self.0.slice(start..))
         }
     }
     pub fn as_reader<'r>(&'r self) -> RelayTransactionSketchResultReader<'r> {
@@ -7933,14 +7933,14 @@ impl<'r> RelayTransactionSketchResultReader<'r> {
         let end = molecule::unpack_number(&slice[8..]) as usize;
         BoolReader::new_unchecked(&self.as_slice()[start..end])
     }
-    pub fn missing_short_ids(&self) -> Byte32VecReader<'r> {
+    pub fn missing_short_ids(&self) -> Uint32VecReader<'r> {
         let slice = self.as_slice();
         let start = molecule::unpack_number(&slice[8..]) as usize;
         if self.has_extra_fields() {
             let end = molecule::unpack_number(&slice[12..]) as usize;
-            Byte32VecReader::new_unchecked(&self.as_slice()[start..end])
+            Uint32VecReader::new_unchecked(&self.as_slice()[start..end])
         } else {
-            Byte32VecReader::new_unchecked(&self.as_slice()[start..])
+            Uint32VecReader::new_unchecked(&self.as_slice()[start..])
         }
     }
 }
@@ -7991,14 +7991,14 @@ impl<'r> molecule::prelude::Reader<'r> for RelayTransactionSketchResultReader<'r
             return ve!(Self, OffsetsNotMatch);
         }
         BoolReader::verify(&slice[offsets[0]..offsets[1]], compatible)?;
-        Byte32VecReader::verify(&slice[offsets[1]..offsets[2]], compatible)?;
+        Uint32VecReader::verify(&slice[offsets[1]..offsets[2]], compatible)?;
         Ok(())
     }
 }
 #[derive(Clone, Debug, Default)]
 pub struct RelayTransactionSketchResultBuilder {
     pub(crate) success: Bool,
-    pub(crate) missing_short_ids: Byte32Vec,
+    pub(crate) missing_short_ids: Uint32Vec,
 }
 impl RelayTransactionSketchResultBuilder {
     pub const FIELD_COUNT: usize = 2;
@@ -8006,7 +8006,7 @@ impl RelayTransactionSketchResultBuilder {
         self.success = v;
         self
     }
-    pub fn missing_short_ids(mut self, v: Byte32Vec) -> Self {
+    pub fn missing_short_ids(mut self, v: Uint32Vec) -> Self {
         self.missing_short_ids = v;
         self
     }

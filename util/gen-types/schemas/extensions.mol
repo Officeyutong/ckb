@@ -156,7 +156,7 @@ table GetRelayTransactionExtendedSketch {
 }
 table RelayTransactionSketchResult {
     success:                Bool,
-    missing_short_ids:      Byte32Vec,
+    missing_short_ids:      Uint32Vec,
 }
 
 table CompactBlock {
