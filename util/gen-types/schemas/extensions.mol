@@ -150,6 +150,7 @@ table GetRelayTransactionSketch {
 }
 table RelayTransactionSketch {
     short_id_sketch:                  Bytes,
+    sketch_size:                      Uint32,
 }
 table GetRelayTransactionExtendedSketch {
     
