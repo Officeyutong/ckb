@@ -149,7 +149,7 @@ table GetRelayTransactionSketch {
     q:           Uint64,
 }
 table RelayTransactionSketch {
-    short_id_sketch:                  Byte32Vec,
+    short_id_sketch:                  Bytes,
 }
 table GetRelayTransactionExtendedSketch {
     

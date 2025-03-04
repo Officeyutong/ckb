@@ -7421,14 +7421,14 @@ impl RelayTransactionSketch {
     pub fn has_extra_fields(&self) -> bool {
         Self::FIELD_COUNT != self.field_count()
     }
-    pub fn short_id_sketch(&self) -> Byte32Vec {
+    pub fn short_id_sketch(&self) -> Bytes {
         let slice = self.as_slice();
         let start = molecule::unpack_number(&slice[4..]) as usize;
         if self.has_extra_fields() {
             let end = molecule::unpack_number(&slice[8..]) as usize;
-            Byte32Vec::new_unchecked(self.0.slice(start..end))
+            Bytes::new_unchecked(self.0.slice(start..end))
         } else {
-            Byte32Vec::new_unchecked(self.0.slice(start..))
+            Bytes::new_unchecked(self.0.slice(start..))
         }
     }
     pub fn as_reader<'r>(&'r self) -> RelayTransactionSketchReader<'r> {
@@ -7505,14 +7505,14 @@ impl<'r> RelayTransactionSketchReader<'r> {
     pub fn has_extra_fields(&self) -> bool {
         Self::FIELD_COUNT != self.field_count()
     }
-    pub fn short_id_sketch(&self) -> Byte32VecReader<'r> {
+    pub fn short_id_sketch(&self) -> BytesReader<'r> {
         let slice = self.as_slice();
         let start = molecule::unpack_number(&slice[4..]) as usize;
         if self.has_extra_fields() {
             let end = molecule::unpack_number(&slice[8..]) as usize;
-            Byte32VecReader::new_unchecked(&self.as_slice()[start..end])
+            BytesReader::new_unchecked(&self.as_slice()[start..end])
         } else {
-            Byte32VecReader::new_unchecked(&self.as_slice()[start..])
+            BytesReader::new_unchecked(&self.as_slice()[start..])
         }
     }
 }
@@ -7562,17 +7562,17 @@ impl<'r> molecule::prelude::Reader<'r> for RelayTransactionSketchReader<'r> {
         if offsets.windows(2).any(|i| i[0] > i[1]) {
             return ve!(Self, OffsetsNotMatch);
         }
-        Byte32VecReader::verify(&slice[offsets[0]..offsets[1]], compatible)?;
+        BytesReader::verify(&slice[offsets[0]..offsets[1]], compatible)?;
         Ok(())
     }
 }
 #[derive(Clone, Debug, Default)]
 pub struct RelayTransactionSketchBuilder {
-    pub(crate) short_id_sketch: Byte32Vec,
+    pub(crate) short_id_sketch: Bytes,
 }
 impl RelayTransactionSketchBuilder {
     pub const FIELD_COUNT: usize = 1;
-    pub fn short_id_sketch(mut self, v: Byte32Vec) -> Self {
+    pub fn short_id_sketch(mut self, v: Bytes) -> Self {
         self.short_id_sketch = v;
         self
     }
