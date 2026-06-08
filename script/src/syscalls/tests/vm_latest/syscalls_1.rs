@@ -780,17 +780,23 @@ fn test_load_header_missing_transaction_info() {
             machine.set_register(A5, HeaderField::EpochNumber as u64);
             machine.set_register(A7, syscall_number);
 
-            assert!(machine.memory_mut().store64(&size_addr, &100).is_ok());
-
+            let header = HeaderBuilder::default().build();
             let cell = build_cell_meta(100, Bytes::new());
+            let mut headers = HashMap::default();
+            headers.insert(header.hash(), header.clone());
+            let data_loader = MockDataLoader {
+                headers,
+                ..Default::default()
+            };
             let rtx = Arc::new(ResolvedTransaction {
-                transaction: TransactionBuilder::default().build(),
+                transaction: TransactionBuilder::default()
+                    .header_dep(header.hash())
+                    .build(),
                 resolved_cell_deps: vec![cell.clone()],
                 resolved_inputs: vec![cell],
                 resolved_dep_groups: vec![],
             });
-
-            let sg_data = build_sg_data(rtx, vec![0], vec![]);
+            let sg_data = build_sg_data_with_loader(rtx, data_loader, vec![0], vec![]);
             let mut load_header = LoadHeader::new(&sg_data);
 
             assert!(load_header.ecall(&mut machine).is_ok());

@@ -70,6 +70,101 @@ fn test_current_cycles() {
     assert_eq!(machine.registers()[A0], cycles);
 }
 
+#[test]
+fn test_pipe_fd_address_overflow() {
+    let mut machine = SCRIPT_VERSION.init_core_machine_without_limit();
+
+    machine.set_register(A0, u64::MAX);
+    machine.set_register(A7, PIPE);
+
+    let rtx = Arc::new(ResolvedTransaction {
+        transaction: TransactionBuilder::default().build(),
+        resolved_cell_deps: vec![],
+        resolved_inputs: vec![],
+        resolved_dep_groups: vec![],
+    });
+    let sg_data = build_sg_data(rtx, vec![], vec![]);
+    let vm_context = VmContext::new(&sg_data, &Arc::new(Mutex::new(Vec::new())));
+    let mut pipe = Pipe::new(&0, &vm_context);
+
+    assert!(matches!(
+        pipe.ecall(&mut machine),
+        Err(ckb_vm::Error::MemOutOfBound)
+    ));
+}
+
+#[test]
+fn test_spawn_args_address_out_of_bound() {
+    let mut machine = SCRIPT_VERSION.init_core_machine_without_limit();
+
+    machine.set_register(A0, 0);
+    machine.set_register(A1, u64::from(Source::Transaction(SourceEntry::CellDep)));
+    machine.set_register(A2, 0);
+    machine.set_register(A3, 0);
+    machine.set_register(A4, u64::MAX);
+    machine.set_register(A7, SPAWN);
+
+    let rtx = Arc::new(ResolvedTransaction {
+        transaction: TransactionBuilder::default().build(),
+        resolved_cell_deps: vec![],
+        resolved_inputs: vec![],
+        resolved_dep_groups: vec![],
+    });
+    let sg_data = build_sg_data(rtx, vec![], vec![]);
+    let vm_context = VmContext::new(&sg_data, &Arc::new(Mutex::new(Vec::new())));
+    let mut spawn = Spawn::new(&0, &vm_context);
+
+    assert!(matches!(
+        spawn.ecall(&mut machine),
+        Err(ckb_vm::Error::MemOutOfBound)
+    ));
+}
+
+#[test]
+fn test_spawn_inherited_fds_address_out_of_bound() {
+    let mut machine = SCRIPT_VERSION.init_core_machine_without_limit();
+    let spawn_args_addr = 0;
+
+    machine
+        .memory_mut()
+        .store64(&spawn_args_addr, &0)
+        .expect("store argc");
+    machine
+        .memory_mut()
+        .store64(&(spawn_args_addr + 8), &0)
+        .expect("store argv");
+    machine
+        .memory_mut()
+        .store64(&(spawn_args_addr + 16), &0)
+        .expect("store process_id");
+    machine
+        .memory_mut()
+        .store64(&(spawn_args_addr + 24), &u64::MAX)
+        .expect("store inherited_fds");
+
+    machine.set_register(A0, 0);
+    machine.set_register(A1, u64::from(Source::Transaction(SourceEntry::CellDep)));
+    machine.set_register(A2, 0);
+    machine.set_register(A3, 0);
+    machine.set_register(A4, spawn_args_addr);
+    machine.set_register(A7, SPAWN);
+
+    let rtx = Arc::new(ResolvedTransaction {
+        transaction: TransactionBuilder::default().build(),
+        resolved_cell_deps: vec![],
+        resolved_inputs: vec![],
+        resolved_dep_groups: vec![],
+    });
+    let sg_data = build_sg_data(rtx, vec![], vec![]);
+    let vm_context = VmContext::new(&sg_data, &Arc::new(Mutex::new(Vec::new())));
+    let mut spawn = Spawn::new(&0, &vm_context);
+
+    assert!(matches!(
+        spawn.ecall(&mut machine),
+        Err(ckb_vm::Error::MemOutOfBound)
+    ));
+}
+
 fn _test_load_extension(
     data: &[u8],
     index: u64,
@@ -204,17 +299,23 @@ fn test_load_extension_missing_transaction_info() {
         machine.set_register(A4, u64::from(source));
         machine.set_register(A7, LOAD_BLOCK_EXTENSION);
 
-        assert!(machine.memory_mut().store64(&size_addr, &100).is_ok());
-
+        let header = HeaderBuilder::default().build();
         let cell = build_cell_meta(100, Bytes::new());
+        let mut extensions = HashMap::default();
+        extensions.insert(header.hash(), Bytes::from_static(b"extension").into());
+        let data_loader = MockDataLoader {
+            extensions,
+            ..Default::default()
+        };
         let rtx = Arc::new(ResolvedTransaction {
-            transaction: TransactionBuilder::default().build(),
+            transaction: TransactionBuilder::default()
+                .header_dep(header.hash())
+                .build(),
             resolved_cell_deps: vec![cell.clone()],
             resolved_inputs: vec![cell],
             resolved_dep_groups: vec![],
         });
-
-        let sg_data = build_sg_data(rtx, vec![0], vec![]);
+        let sg_data = build_sg_data_with_loader(rtx, data_loader, vec![0], vec![]);
         let mut load_block_extension = LoadBlockExtension::new(&sg_data);
 
         assert!(load_block_extension.ecall(&mut machine).is_ok());
