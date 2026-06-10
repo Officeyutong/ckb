@@ -352,6 +352,15 @@ impl TxPoolService {
         self.enqueue_verify_queue(tx, is_proposal_tx, remote).await
     }
 
+    pub(crate) async fn notify_tx(&self, tx: TransactionView) -> Result<bool, Reject> {
+        let tx_hash = tx.hash();
+        let ret = self.resumeble_process_tx(tx, true, None).await;
+        if matches!(ret, Err(Reject::Full(_))) {
+            self.send_result_to_relayer(TxVerificationResult::Reject { tx_hash });
+        }
+        ret
+    }
+
     pub(crate) async fn test_accept_tx(&self, tx: TransactionView) -> Result<Completed, Reject> {
         // non contextual verify first
         self.non_contextual_verify(&tx, None).await?;
