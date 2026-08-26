@@ -49,7 +49,8 @@ fn prepare_store(
 
     txn.insert_block_epoch_index(&parent.hash(), &epoch_hash)
         .unwrap();
-    txn.insert_epoch_ext(&epoch_hash, &epoch_ext).unwrap();
+    txn.insert_canonical_epoch_ext(&epoch_hash, &epoch_ext)
+        .unwrap();
 
     txn.commit().unwrap();
 

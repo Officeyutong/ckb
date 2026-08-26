@@ -90,6 +90,33 @@ fn index_store() {
 }
 
 #[test]
+fn fork_epoch_data_does_not_overwrite_canonical_epoch_index() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db = RocksDB::open_in(&tmp_dir, COLUMNS);
+    let store = ChainDB::new(db, Default::default());
+    let consensus = ConsensusBuilder::default().build();
+    let epoch = consensus.genesis_epoch_ext();
+    let canonical_hash = consensus.genesis_block().hash();
+    let fork_hash = packed::Header::new_builder()
+        .nonce(1u128)
+        .build()
+        .calc_header_hash();
+    assert_ne!(canonical_hash, fork_hash);
+
+    let txn = store.begin_transaction();
+    txn.insert_canonical_epoch_ext(&canonical_hash, epoch)
+        .unwrap();
+    txn.commit().unwrap();
+
+    let txn = store.begin_transaction();
+    txn.insert_epoch_ext(&fork_hash, epoch).unwrap();
+    txn.commit().unwrap();
+
+    assert_eq!(store.get_epoch_index(epoch.number()), Some(canonical_hash));
+    assert_eq!(store.get_epoch_ext(&fork_hash), Some(epoch.clone()));
+}
+
+#[test]
 fn freeze_blockv0() {
     let tmp_dir = TempDir::new().unwrap();
     let db = RocksDB::open_in(&tmp_dir, COLUMNS);

@@ -324,6 +324,9 @@ impl ConsumeUnverifiedBlockProcessor {
             &epoch.last_block_hash_in_previous_epoch(),
         )?;
         if new_epoch {
+            // Epoch data is fork-specific. Do not update the canonical epoch-number
+            // index until this fork has passed contextual verification and become
+            // the main chain.
             db_txn.insert_epoch_ext(&epoch.last_block_hash_in_previous_epoch(), &epoch)?;
         }
 
@@ -344,6 +347,17 @@ impl ConsumeUnverifiedBlockProcessor {
             // MUST update index before reconcile_main_chain
             let begin_reconcile_main_chain = std::time::Instant::now();
             self.reconcile_main_chain(Arc::clone(&db_txn), &mut fork, switch)?;
+            for attached_block in fork.attached_blocks() {
+                if attached_block.epoch().index() == 0 {
+                    let epoch_hash = db_txn
+                        .get_block_epoch_index(&attached_block.hash())
+                        .expect("attached block epoch should be stored");
+                    let attached_epoch = db_txn
+                        .get_epoch_ext(&epoch_hash)
+                        .expect("attached epoch should be stored");
+                    db_txn.insert_epoch_index(attached_epoch.number(), &epoch_hash)?;
+                }
+            }
             trace!(
                 "reconcile_main_chain cost {:?}",
                 begin_reconcile_main_chain.elapsed()

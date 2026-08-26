@@ -371,22 +371,27 @@ async fn contextual_check(
     }
 
     let parent_hash = compact_block_header.parent_hash();
-    let maybe_epoch = if let Some(parent_header) = shared.store().get_block_header(&parent_hash) {
-        shared
-            .consensus()
-            .next_epoch_ext(&parent_header, &shared.store().borrow_as_data_loader())
-            .map(|next_epoch| next_epoch.epoch())
-    } else {
-        let parent_epoch = parent.epoch();
-        if parent_epoch.index() + 1 < parent_epoch.length() {
-            shared
-                .store()
-                .get_epoch_index(parent_epoch.number())
-                .and_then(|index| shared.store().get_epoch_ext(&index))
+    let (maybe_epoch, epoch_context_is_complete) =
+        if let Some(parent_header) = shared.store().get_block_header(&parent_hash) {
+            (
+                shared
+                    .consensus()
+                    .next_epoch_ext(&parent_header, &shared.store().borrow_as_data_loader())
+                    .map(|next_epoch| next_epoch.epoch()),
+                true,
+            )
         } else {
-            None
-        }
-    };
+            let parent_epoch = parent.epoch();
+            let epoch = if parent_epoch.index() + 1 < parent_epoch.length() {
+                shared
+                    .store()
+                    .get_epoch_index(parent_epoch.number())
+                    .and_then(|index| shared.store().get_epoch_ext(&index))
+            } else {
+                None
+            };
+            (epoch, false)
+        };
 
     let Some(epoch) = maybe_epoch else {
         return StatusCode::CompactBlockRequiresParent.with_context(format!(
@@ -399,6 +404,14 @@ async fn contextual_check(
     let expected_compact_target = epoch.compact_target();
     let actual_compact_target = compact_block_header.compact_target();
     if actual_epoch != expected_epoch || actual_compact_target != expected_compact_target {
+        // An epoch obtained by number alone is canonical-chain data, while the
+        // header-only parent may belong to another fork. Without the parent body
+        // this mismatch is not proof that the compact block is invalid.
+        if !epoch_context_is_complete {
+            return StatusCode::CompactBlockRequiresParent.with_context(format!(
+                "{block_hash} requires parent {parent_hash} to verify epoch"
+            ));
+        }
         shared
             .shared()
             .insert_block_status(block_hash.clone(), BlockStatus::BLOCK_INVALID);
