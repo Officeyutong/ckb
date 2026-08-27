@@ -343,8 +343,8 @@ impl ConsumeUnverifiedBlockProcessor {
             self.find_fork(&mut fork, current_tip_header.number(), block, ext);
             self.rollback(&fork, &db_txn)?;
 
-            // update and verify chain root
-            // MUST update index before reconcile_main_chain
+            // Verify/reconcile the fork first. Only after it becomes the main chain,
+            // update the canonical epoch-number index for attached epoch-boundary blocks.
             let begin_reconcile_main_chain = std::time::Instant::now();
             self.reconcile_main_chain(Arc::clone(&db_txn), &mut fork, switch)?;
             for attached_block in fork.attached_blocks() {
