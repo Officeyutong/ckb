@@ -48,22 +48,21 @@ fn success() -> TerminatedResult {
 
 #[tokio::test]
 async fn initial_suspend_and_stop_do_not_enter_the_scheduler() {
-    let (commands, receiver) = watch::channel(ChunkCommand::Suspend);
-    let (receipts, receipt) = watch::channel(Slice::default());
-    let mut execution = Box::pin(execute_slices(
-        |_| panic!("the scheduler must wait for Resume"),
-        receiver,
-        Pause::new(),
-        receipts,
-        false,
-    ));
-    assert!(poll!(&mut execution).is_pending());
-    assert_eq!(receipt.borrow().phase, Phase::Idle);
-    commands.send(ChunkCommand::Stop).unwrap();
-    assert_eq!(
-        execution.await.unwrap_err(),
-        Error::External("stopped".into())
-    );
+    for limit in [None, Some(TEST_TIMEOUT)] {
+        let (commands, mut receiver) = watch::channel(ChunkCommand::Suspend);
+        let mut runner = VmRunner {
+            command: &mut receiver,
+            remaining: limit,
+        };
+        let mut execution =
+            Box::pin(runner.run_vm(|_| panic!("the scheduler must wait for Resume")));
+        assert!(poll!(&mut execution).is_pending());
+        commands.send(ChunkCommand::Stop).unwrap();
+        assert_eq!(
+            execution.await.unwrap_err(),
+            Error::External("stopped".into())
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -84,7 +83,7 @@ async fn resume_waits_for_the_interrupted_slice_to_return() {
     assert!(poll!(&mut verification).is_pending());
     assert!(
         first.pause.has_interrupted(),
-        "Resume must wait for the Idle receipt"
+        "Resume must wait for the previous slice to return"
     );
     assert!(invocations.try_recv().is_err());
     first.finish.send(Err(Error::Pause)).unwrap();
@@ -145,6 +144,38 @@ async fn cancellation_interrupts_and_releases_running_vm_work() {
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn stop_and_closed_control_join_running_vm_work_before_returning() {
+    for close in [false, true] {
+        let (commands, mut receiver) = watch::channel(ChunkCommand::Resume);
+        let (execute, mut invocations, dropped) = controlled_vm();
+        let mut runner = VmRunner {
+            command: &mut receiver,
+            remaining: Some(TEST_TIMEOUT),
+        };
+        let mut verification = Box::pin(runner.run_vm(execute));
+        assert!(poll!(&mut verification).is_pending());
+        let running = invocations.recv().await.unwrap();
+        if close {
+            drop(commands);
+        } else {
+            // Observe Stop before testing that later Resume cannot reverse it.
+            commands.send(ChunkCommand::Stop).unwrap();
+            assert!(poll!(&mut verification).is_pending());
+            commands.send(ChunkCommand::Resume).unwrap();
+        }
+        assert!(poll!(&mut verification).is_pending());
+        assert!(running.pause.has_interrupted());
+        running.finish.send(Err(Error::Pause)).unwrap();
+        assert_eq!(
+            verification.await.unwrap_err(),
+            Error::External("stopped".into())
+        );
+        dropped.await.unwrap();
+        assert!(invocations.recv().await.is_none());
+    }
 }
 
 #[tokio::test]
@@ -249,29 +280,146 @@ async fn groups_share_the_budget_and_exhaustion_precedes_completion() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn consuming_the_timer_interrupt_does_not_rearm_the_deadline() {
+    let (_commands, mut receiver) = watch::channel(ChunkCommand::Resume);
+    let (execute, mut invocations, dropped) = controlled_vm();
+    let mut runner = VmRunner {
+        command: &mut receiver,
+        remaining: Some(Duration::from_millis(10)),
+    };
+    let mut verification = Box::pin(runner.run_vm(execute));
+    assert!(poll!(&mut verification).is_pending());
+    let mut running = invocations.recv().await.unwrap();
+    tokio::select! {
+        result = &mut verification => panic!("the slice has not returned: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+    }
+    assert!(running.pause.has_interrupted());
+    // CKB-VM clears the interrupt when it observes Pause, before the scheduler
+    // returns. A completed deadline must remain inert during that interval.
+    running.pause.free();
+    assert!(poll!(&mut verification).is_pending());
+    assert!(!running.pause.has_interrupted());
+    running.finish.send(Err(Error::Pause)).unwrap();
+    assert!(verification.await.unwrap().is_none());
+    dropped.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn waiting_to_poll_a_completed_slice_does_not_spend_vm_time() {
+    let (_commands, mut receiver) = watch::channel(ChunkCommand::Resume);
+    let (finished, finish) = oneshot::channel();
+    let mut runner = VmRunner {
+        command: &mut receiver,
+        remaining: Some(Duration::from_millis(250)),
+    };
+    let mut finished = Some(finished);
+    let mut verification = Box::pin(runner.run_vm(move |_| {
+        finished.take().unwrap().send(()).unwrap();
+        Ok(success())
+    }));
+    assert!(poll!(&mut verification).is_pending());
+    finish.await.unwrap();
+    // The parent remains unpolled while its wall-clock deadline passes.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(verification.await.unwrap().unwrap().consumed_cycles, 42);
+}
+
 #[test]
-fn cumulative_receipts_exclude_idle_time_and_replace_stale_deadlines() {
-    let limit = Duration::from_millis(10);
-    let started = Instant::now();
-    let mut slice = Slice::default();
-    assert_eq!(slice.deadline(limit), None);
-    slice.phase = Phase::Running(started);
-    let old_deadline = slice.deadline(limit).unwrap();
-    assert_eq!(old_deadline, started + limit);
-    slice.charged = Duration::from_millis(3);
-    slice.phase = Phase::Idle;
-    assert_eq!(slice.deadline(limit), None);
-    let resumed = started + Duration::from_secs(60);
-    slice.phase = Phase::Running(resumed);
-    assert_eq!(
-        slice.deadline(limit),
-        Some(resumed + Duration::from_millis(7))
-    );
-    assert!(resumed > old_deadline);
-    for spent in [9, 10, 11] {
-        slice.charged = Duration::from_millis(spent);
-        slice.phase = Phase::Finished;
-        assert_eq!(slice.deadline(limit), None);
-        assert_eq!(limit.saturating_sub(slice.charged).is_zero(), spent >= 10);
+fn waiting_for_a_runtime_worker_does_not_spend_vm_time() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (occupied, worker_occupied) = mpsc::channel();
+    let (release, released) = mpsc::channel();
+    let blocker = runtime.spawn(async move {
+        occupied.send(()).unwrap();
+        released.recv_timeout(TEST_TIMEOUT).unwrap();
+    });
+    worker_occupied.recv_timeout(TEST_TIMEOUT).unwrap();
+    runtime.block_on(async {
+        let (_commands, mut receiver) = watch::channel(ChunkCommand::Resume);
+        let mut runner = VmRunner {
+            command: &mut receiver,
+            remaining: Some(Duration::from_millis(250)),
+        };
+        let mut verification = Box::pin(runner.run_vm(|_| Ok(success())));
+        assert!(poll!(&mut verification).is_pending());
+        // Keep the only worker occupied past the budget before releasing it.
+        std::thread::sleep(Duration::from_millis(350));
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        assert_eq!(verification.await.unwrap().unwrap().consumed_cycles, 42);
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn scheduler_state_and_cycles_survive_joined_pauses() {
+    use super::super::tests::{program_transaction, snapshot};
+    use ckb_chain_spec::consensus::ConsensusBuilder;
+    use ckb_script::{ScriptVersion, TransactionScriptsVerifier};
+    use ckb_store::data_loader_wrapper::AsDataLoader;
+    use ckb_types::core::hardfork::HardForks;
+    use ckb_verification::TxVerifyEnv;
+    use std::sync::Arc;
+
+    let snapshot = snapshot(Arc::new(
+        ConsensusBuilder::default()
+            .hardfork_switch(HardForks::new_dev())
+            .build(),
+    ));
+    let env = Arc::new(TxVerifyEnv::new_submit(snapshot.tip_header()));
+    for version in [ScriptVersion::V0, ScriptVersion::V1, ScriptVersion::V2] {
+        let programs: &[&[u8]] = if version == ScriptVersion::V2 {
+            &[
+                include_bytes!("../../../../script/testdata/spawn_caller_exec"),
+                include_bytes!("../../../../script/testdata/current_cycles"),
+            ]
+        } else {
+            &[include_bytes!("../../../../script/testdata/debugger")]
+        };
+        let verifier = TransactionScriptsVerifier::new(
+            program_transaction(version, programs),
+            snapshot.as_data_loader(),
+            snapshot.cloned_consensus(),
+            Arc::clone(&env),
+        );
+        let (_, group) = verifier.groups().next().unwrap();
+        let expected = verifier.detailed_run(group, u64::MAX).unwrap();
+        let mut scheduler = verifier.create_scheduler(group).unwrap();
+        let (_commands, mut receiver) = watch::channel(ChunkCommand::Resume);
+        let mut runner = VmRunner {
+            command: &mut receiver,
+            remaining: Some(TEST_TIMEOUT),
+        };
+        let mut attempts = 0;
+        let actual = runner
+            .run_vm(move |pause| {
+                if attempts < 3 {
+                    // On V2 advance into spawned VM work before pausing, using
+                    // the scheduler's normal stepping interface.
+                    if version == ScriptVersion::V2 && attempts == 0 {
+                        scheduler.iterate()?;
+                    }
+                    pause.interrupt();
+                    attempts += 1;
+                    let result = scheduler.run(RunMode::Pause(pause, u64::MAX));
+                    assert!(
+                        matches!(result, Err(Error::Pause)),
+                        "{version:?}, attempt {attempts}: {result:?}"
+                    );
+                    result
+                } else {
+                    scheduler.run(RunMode::Pause(pause, u64::MAX))
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.exit_code, expected.exit_code);
+        assert_eq!(actual.consumed_cycles, expected.consumed_cycles);
     }
 }

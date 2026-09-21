@@ -141,7 +141,7 @@ async fn dao_lock_size_is_checked_before_every_script_verification_route() {
     }
 }
 
-fn snapshot(consensus: Arc<ckb_chain_spec::consensus::Consensus>) -> Arc<Snapshot> {
+pub(super) fn snapshot(consensus: Arc<ckb_chain_spec::consensus::Consensus>) -> Arc<Snapshot> {
     let tmp = TempDir::new().unwrap();
     let store = ChainDB::new(RocksDB::open_in(&tmp, 1), Default::default());
     Arc::new(Snapshot::new(
@@ -154,7 +154,7 @@ fn snapshot(consensus: Arc<ckb_chain_spec::consensus::Consensus>) -> Arc<Snapsho
     ))
 }
 
-fn program_transaction(
+pub(super) fn program_transaction(
     version: ScriptVersion,
     programs: &[&'static [u8]],
 ) -> Arc<ResolvedTransaction> {
