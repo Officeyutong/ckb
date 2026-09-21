@@ -27,10 +27,37 @@ use tokio::time::sleep;
 
 const MAX_TX_VERIFY_CYCLES: u64 = 70_000_000;
 const UNUSED_SNAPSHOT_COLUMNS: u32 = 1;
+
+#[test]
+fn verify_queue_preserves_network_origin_without_budgeting_local_recovery() {
+    let mut queue = VerifyQueue::new(MAX_TX_VERIFY_CYCLES);
+    let recovery = build_tx(vec![(&H256([1; 32]).into(), 0)], 1);
+    let proposal = build_tx(vec![(&H256([2; 32]).into(), 0)], 1);
+    let relay = build_tx(vec![(&H256([3; 32]).into(), 0)], 1);
+    queue.add_tx(recovery.clone(), false, None).unwrap();
+    queue.add_tx(proposal.clone(), true, None).unwrap();
+    queue
+        .add_tx(relay.clone(), false, Some((1, 1.into())))
+        .unwrap();
+
+    let proposed = queue.pop_front(false).unwrap();
+    assert_eq!(proposed.tx, proposal);
+    assert!(proposed.is_proposal);
+    assert!(proposed.remote.is_none());
+    let recovered = queue.remove_tx_by_hash(&recovery.hash()).unwrap();
+    assert!(!recovered.is_proposal);
+    assert!(recovered.remote.is_none());
+    let relayed = queue.pop_front(false).unwrap();
+    assert_eq!(relayed.tx, relay);
+    assert!(!relayed.is_proposal);
+    assert_eq!(relayed.remote, Some((1, 1.into())));
+}
+
 #[tokio::test]
 async fn verify_queue_basic() {
     let tx = TransactionBuilder::default().build();
     let entry = Entry {
+        is_proposal: false,
         tx: tx.clone(),
         remote: None,
     };
@@ -248,6 +275,7 @@ async fn verify_queue_pops_proposals_by_arrival_order() {
 #[tokio::test]
 async fn verify_queue_remove() {
     let entry1 = Entry {
+        is_proposal: false,
         tx: TransactionBuilder::default()
             .set_outputs_data(vec![Default::default()])
             .build(),
@@ -256,6 +284,7 @@ async fn verify_queue_remove() {
     let entry1_id = entry1.tx.proposal_short_id();
     eprintln!("entry1_id: {:?}", entry1_id);
     let entry2 = Entry {
+        is_proposal: false,
         tx: TransactionBuilder::default()
             .set_cell_deps(vec![Default::default(), Default::default()])
             .build(),
@@ -264,6 +293,7 @@ async fn verify_queue_remove() {
     let entry2_id = entry2.tx.proposal_short_id();
     eprintln!("entry2_id: {:?}", entry2_id);
     let entry3 = Entry {
+        is_proposal: false,
         tx: TransactionBuilder::default().build(),
         remote: None,
     };
@@ -271,6 +301,7 @@ async fn verify_queue_remove() {
     eprintln!("entry3_id: {:?}", entry3_id);
 
     let entry4 = Entry {
+        is_proposal: false,
         tx: TransactionBuilder::default()
             .set_cell_deps(vec![
                 Default::default(),
@@ -325,6 +356,7 @@ fn tx_pool_config() -> TxPoolConfig {
         min_fee_rate: FeeRate::zero(),
         min_rbf_rate: FeeRate::zero(),
         max_tx_verify_cycles: MAX_TX_VERIFY_CYCLES,
+        max_tx_verify_time_ms: std::num::NonZeroU32::new(8_000).unwrap(),
         max_tx_verify_workers: 1,
         max_ancestors_count: 125,
         keep_rejected_tx_hashes_days: 1,
@@ -490,4 +522,26 @@ async fn notify_tx_notifies_relayer_when_verify_queue_is_full() {
         }
         _ => panic!("expected reject notification"),
     }
+}
+
+#[tokio::test]
+async fn relay_and_proposal_budget_refusals_release_the_known_marker() {
+    let (service, receiver) = service_with_relay_receiver();
+    let snapshot = service.tx_pool.read().await.cloned_snapshot();
+    let tx = build_tx(vec![(&H256([1; 32]).into(), 0)], 1);
+    for remote in [Some((1, 1.into())), None] {
+        service
+            .after_process(
+                tx.clone(),
+                remote,
+                &snapshot,
+                &Err(crate::error::Reject::ExcessiveVerifyTime),
+            )
+            .await;
+        assert!(matches!(
+            receiver.try_recv().expect("budget refusal must release the known marker"),
+            TxVerificationResult::Reject { tx_hash } if tx_hash == tx.hash()
+        ));
+    }
+    assert!(receiver.try_recv().is_err(), "one completion per attempt");
 }

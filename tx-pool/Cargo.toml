@@ -35,6 +35,7 @@ ckb-network.workspace = true
 ckb-channel.workspace = true
 ckb-db.workspace = true
 ckb-script.workspace = true
+ckb-vm.workspace = true
 futures-util.workspace = true
 sentry = { workspace = true, optional = true }
 serde_json.workspace = true
@@ -49,6 +50,7 @@ tokio-util.workspace = true
 ckb-fee-estimator.workspace = true
 
 [dev-dependencies]
+ckb-app-config = { workspace = true, features = ["test"] }
 tempfile.workspace = true
 ckb-hash.workspace = true
 ckb-systemtime = { workspace = true, features = ["enable_faketime"] }
