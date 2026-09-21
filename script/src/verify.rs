@@ -277,6 +277,20 @@ where
     }
 }
 
+/// Controls how a script group's scheduler is executed.
+///
+/// Returning `None` stops verification without declaring the transaction invalid.
+/// The verifier retains Type ID validation, cycle accounting and script error attribution.
+#[cfg(not(target_family = "wasm"))]
+pub trait SchedulerRunner<S>: Send {
+    /// Execute the scheduler within its remaining consensus cycle limit.
+    fn run(
+        &mut self,
+        scheduler: S,
+        max_cycles: Cycle,
+    ) -> impl std::future::Future<Output = Result<Option<TerminatedResult>, VMInternalError>> + Send;
+}
+
 #[cfg(not(target_family = "wasm"))]
 impl<DL, V, M> TransactionScriptsVerifier<DL, V, M>
 where
@@ -284,78 +298,103 @@ where
     V: Send + Clone + 'static,
     M: DefaultMachineRunner + Send + 'static,
 {
-    /// Performing a resumable verification on the transaction scripts with signal channel,
-    /// if `Suspend` comes from `command_rx`, the process will be hang up until `Resume` comes,
-    /// otherwise, it will return until the verification is completed.
+    /// Verify scripts using caller-controlled scheduler execution.
+    /// Returns `None` if the runner stops before verification completes.
+    pub async fn verify_with_runner(
+        &self,
+        limit_cycles: Cycle,
+        runner: &mut impl SchedulerRunner<Scheduler<DL, V, M>>,
+    ) -> Result<Option<Cycle>, Error> {
+        let mut cycles = 0;
+        for (_hash, group) in self.groups() {
+            let remaining = limit_cycles.checked_sub(cycles).ok_or_else(|| {
+                ScriptError::Other(format!("expect invalid cycles {limit_cycles} {cycles}"))
+                    .source(group)
+            })?;
+            let result = self
+                .verify_group_with_runner(group, remaining, runner)
+                .await;
+            match result {
+                Ok(Some(used)) => cycles = wrapping_cycles_add(cycles, used, group)?,
+                Ok(None) => return Ok(None),
+                Err(error) => {
+                    #[cfg(feature = "logging")]
+                    logging::on_script_error(_hash, &self.hash(), &error);
+                    return Err(error.source(group).into());
+                }
+            }
+        }
+        Ok(Some(cycles))
+    }
+
+    async fn verify_group_with_runner(
+        &self,
+        group: &ScriptGroup,
+        max_cycles: Cycle,
+        runner: &mut impl SchedulerRunner<Scheduler<DL, V, M>>,
+    ) -> Result<Option<Cycle>, ScriptError> {
+        if group.script.code_hash() == TYPE_ID_CODE_HASH.into()
+            && Into::<u8>::into(group.script.hash_type()) == Into::<u8>::into(ScriptHashType::Type)
+        {
+            return TypeIdSystemScript {
+                rtx: &self.tx_data.rtx,
+                script_group: group,
+                max_cycles,
+            }
+            .verify()
+            .map(Some);
+        }
+        let scheduler = self.create_scheduler(group)?;
+        let result = runner
+            .run(scheduler, max_cycles)
+            .await
+            .map_err(|error| self.map_vm_internal_error(error, max_cycles))?;
+        result
+            .map(|result| {
+                if result.exit_code == 0 {
+                    Ok(result.consumed_cycles)
+                } else {
+                    Err(ScriptError::validation_failure(
+                        &group.script,
+                        result.exit_code,
+                    ))
+                }
+            })
+            .transpose()
+    }
+
+    /// Verify scripts with external suspend, resume and stop commands.
     pub async fn resumable_verify_with_signal(
         &self,
         limit_cycles: Cycle,
         command_rx: &mut Receiver<ChunkCommand>,
     ) -> Result<Cycle, Error> {
-        let mut cycles = 0;
-
-        let groups: Vec<_> = self.groups().collect();
-        for (_hash, group) in groups.iter() {
-            // vm should early return invalid cycles
-            let remain_cycles = limit_cycles.checked_sub(cycles).ok_or_else(|| {
-                ScriptError::Other(format!("expect invalid cycles {limit_cycles} {cycles}"))
-                    .source(group)
-            })?;
-
-            match self
-                .verify_group_with_signal(group, remain_cycles, command_rx)
-                .await
-            {
-                Ok(used_cycles) => {
-                    cycles = wrapping_cycles_add(cycles, used_cycles, group)?;
-                }
-                Err(e) => {
-                    #[cfg(feature = "logging")]
-                    logging::on_script_error(_hash, &self.hash(), &e);
-                    return Err(e.source(group).into());
-                }
-            }
-        }
-
-        Ok(cycles)
+        self.verify_with_runner(limit_cycles, &mut SignalRunner(command_rx))
+            .await?
+            .ok_or_else(|| ScriptError::Interrupts.unknown_source().into())
     }
+}
 
-    async fn verify_group_with_signal(
-        &self,
-        group: &ScriptGroup,
-        max_cycles: Cycle,
-        command_rx: &mut Receiver<ChunkCommand>,
-    ) -> Result<Cycle, ScriptError> {
-        if group.script.code_hash() == TYPE_ID_CODE_HASH.into()
-            && Into::<u8>::into(group.script.hash_type()) == Into::<u8>::into(ScriptHashType::Type)
-        {
-            let verifier = TypeIdSystemScript {
-                rtx: &self.tx_data.rtx,
-                script_group: group,
-                max_cycles,
-            };
-            verifier.verify()
-        } else {
-            self.chunk_run_with_signal(group, max_cycles, command_rx)
-                .await
-        }
-    }
+#[cfg(not(target_family = "wasm"))]
+struct SignalRunner<'a>(&'a mut Receiver<ChunkCommand>);
 
-    async fn chunk_run_with_signal(
-        &self,
-        script_group: &ScriptGroup,
+#[cfg(not(target_family = "wasm"))]
+impl<DL, V, M> SchedulerRunner<Scheduler<DL, V, M>> for SignalRunner<'_>
+where
+    DL: CellDataProvider + HeaderProvider + ExtensionProvider + Send + Sync + Clone + 'static,
+    V: Send + Clone + 'static,
+    M: DefaultMachineRunner + Send + 'static,
+{
+    async fn run(
+        &mut self,
+        mut scheduler: Scheduler<DL, V, M>,
         max_cycles: Cycle,
-        signal: &mut Receiver<ChunkCommand>,
-    ) -> Result<Cycle, ScriptError> {
-        let mut scheduler = self.create_scheduler(script_group)?;
+    ) -> Result<Option<TerminatedResult>, VMInternalError> {
         let mut pause = VMPause::new();
         let child_pause = pause.clone();
         let (finish_tx, mut finish_rx) =
             oneshot::channel::<Result<TerminatedResult, ckb_vm::Error>>();
 
-        // send initial `Resume` command to child
-        // it's maybe useful to set initial command to `signal.borrow().to_owned()`
-        // so that we can control the initial state of child, which is useful for testing purpose
         let (child_tx, mut child_rx) = watch::channel(ChunkCommand::Resume);
         let jh = tokio::spawn(async move {
             child_rx.mark_changed();
@@ -372,15 +411,9 @@ where
                         continue;
                     }
                     ChunkCommand::Resume => {
-                        //info!("[verify-test] run_vms_child: resume");
                         let res = scheduler.run(RunMode::Pause(pause_cloned, max_cycles));
                         match res {
-                            Ok(_) => {
-                                let _ = finish_tx.send(res);
-                                return;
-                            }
                             Err(VMInternalError::Pause) => {
-                                // continue to wait for
                                 debug_assert!(
                                     scheduler.consumed_cycles() <= max_cycles,
                                     "Consumed cycles ({}) exceeded max_cycles ({})",
@@ -400,9 +433,8 @@ where
 
         loop {
             tokio::select! {
-                Ok(_) = signal.changed() => {
-                    let command = signal.borrow().to_owned();
-                    //info!("[verify-test] run_vms_with_signal: {:?}", command);
+                Ok(_) = self.0.changed() => {
+                    let command = self.0.borrow().to_owned();
                     match command {
                         ChunkCommand::Suspend => {
                             pause.interrupt();
@@ -419,25 +451,9 @@ where
                 }
                 Ok(res) = &mut finish_rx => {
                     let _ = jh.await;
-                    match res {
-                        Ok(TerminatedResult {
-                            exit_code: 0,
-                            consumed_cycles: cycles,
-                        }) => {
-                            return Ok(cycles);
-                        }
-                        Ok(TerminatedResult { exit_code, .. }) => {
-                            return Err(ScriptError::validation_failure(
-                                &script_group.script,
-                                exit_code
-                            ))},
-                        Err(err) => {
-                            return Err(self.map_vm_internal_error(err, max_cycles));
-                        }
-                    }
-
+                    return res.map(Some);
                 }
-                else => { break Err(ScriptError::validation_failure(&script_group.script, 0)) }
+                else => { return Err(VMInternalError::External("stopped".into())); }
             }
         }
     }

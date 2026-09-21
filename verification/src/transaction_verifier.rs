@@ -7,7 +7,10 @@ use ckb_dao::DaoCalculator;
 use ckb_dao_utils::DaoError;
 use ckb_error::Error;
 #[cfg(not(target_family = "wasm"))]
-use ckb_script::ChunkCommand;
+use ckb_script::{
+    ChunkCommand, Scheduler, SchedulerRunner,
+    types::{DebugPrinter, Machine},
+};
 use ckb_script::{ScriptError, TransactionScriptsVerifier};
 use ckb_traits::{
     CellDataProvider, EpochProvider, ExtensionProvider, HeaderFieldsProvider, HeaderProvider,
@@ -237,6 +240,35 @@ where
         };
         let fee = self.fee_calculator.transaction_fee()?;
         Ok(Completed { cycles, fee })
+    }
+
+    /// Verify contextual rules and cached cycles, delegating uncached VM execution.
+    /// Returns `None` if the runner stops verification.
+    #[cfg(not(target_family = "wasm"))]
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "the explicit Send bound is needed by tx-pool worker futures"
+    )]
+    pub fn verify_with_runner<'a>(
+        &'a self,
+        max_cycles: Cycle,
+        runner: &'a mut impl SchedulerRunner<Scheduler<DL, DebugPrinter, Machine>>,
+    ) -> impl std::future::Future<Output = Result<Option<Completed>, Error>> + Send + 'a {
+        async move {
+            self.time_relative.verify()?;
+            self.capacity.verify()?;
+            let fee = self.fee_calculator.transaction_fee()?;
+            let cycles = match self.script.cached_cycles {
+                Some(_) => Some(self.script.verify(max_cycles)?),
+                None => {
+                    self.script
+                        .inner
+                        .verify_with_runner(max_cycles, runner)
+                        .await?
+                }
+            };
+            Ok(cycles.map(|cycles| Completed { cycles, fee }))
+        }
     }
 
     /// Perform context-dependent verification with command
