@@ -8,7 +8,7 @@ use ckb_dao_utils::DaoError;
 use ckb_error::Error;
 #[cfg(not(target_family = "wasm"))]
 use ckb_script::{
-    ChunkCommand, Scheduler, SchedulerRunner,
+    Scheduler, SchedulerRunner,
     types::{DebugPrinter, Machine},
 };
 use ckb_script::{ScriptError, TransactionScriptsVerifier};
@@ -142,22 +142,6 @@ where
     }
 
     #[cfg(not(target_family = "wasm"))]
-    async fn resumable_verify_with_signal(
-        &self,
-        max_cycles: Cycle,
-        command_rx: &mut tokio::sync::watch::Receiver<ChunkCommand>,
-    ) -> Result<Cycle, Error> {
-        match self.cached_cycles {
-            Some(_) => self.verify(max_cycles),
-            None => {
-                self.inner
-                    .resumable_verify_with_signal(max_cycles, command_rx)
-                    .await
-            }
-        }
-    }
-
-    #[cfg(not(target_family = "wasm"))]
     async fn verify_with_runner(
         &self,
         max_cycles: Cycle,
@@ -270,24 +254,6 @@ where
             let cycles = self.script.verify_with_runner(max_cycles, runner).await?;
             Ok(cycles.map(|cycles| Completed { cycles, fee }))
         }
-    }
-
-    /// Perform context-dependent verification with command
-    /// The verification will be interrupted when receiving a Suspend command
-    #[cfg(not(target_family = "wasm"))]
-    pub async fn verify_with_pause(
-        &self,
-        max_cycles: Cycle,
-        command_rx: &mut tokio::sync::watch::Receiver<ChunkCommand>,
-    ) -> Result<Completed, Error> {
-        self.time_relative.verify()?;
-        self.capacity.verify()?;
-        let fee = self.fee_calculator.transaction_fee()?;
-        let cycles = self
-            .script
-            .resumable_verify_with_signal(max_cycles, command_rx)
-            .await?;
-        Ok(Completed { cycles, fee })
     }
 }
 

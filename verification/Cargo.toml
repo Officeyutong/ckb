@@ -23,7 +23,6 @@ ckb-error.workspace = true
 ckb-constant.workspace = true
 derive_more = { workspace = true, features = ["display"] }
 ckb-verification-traits.workspace = true
-tokio = { workspace = true, features = ["sync", "macros"] }
 
 
 [dev-dependencies]

@@ -1,5 +1,3 @@
-#[cfg(not(target_family = "wasm"))]
-use crate::ChunkCommand;
 use crate::scheduler::Scheduler;
 use crate::{
     error::{ScriptError, TransactionScriptError},
@@ -21,15 +19,8 @@ use ckb_types::{
     core::{Cycle, ScriptHashType, cell::ResolvedTransaction},
     packed::{Byte32, Script},
 };
-#[cfg(not(target_family = "wasm"))]
-use ckb_vm::machine::Pause as VMPause;
 use ckb_vm::{DefaultMachineRunner, Error as VMInternalError};
 use std::sync::Arc;
-#[cfg(not(target_family = "wasm"))]
-use tokio::sync::{
-    oneshot,
-    watch::{self, Receiver},
-};
 
 #[cfg(test)]
 mod tests;
@@ -361,101 +352,6 @@ where
                 }
             })
             .transpose()
-    }
-
-    /// Verify scripts with external suspend, resume and stop commands.
-    pub async fn resumable_verify_with_signal(
-        &self,
-        limit_cycles: Cycle,
-        command_rx: &mut Receiver<ChunkCommand>,
-    ) -> Result<Cycle, Error> {
-        self.verify_with_runner(limit_cycles, &mut SignalRunner(command_rx))
-            .await?
-            .ok_or_else(|| ScriptError::Interrupts.unknown_source().into())
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
-struct SignalRunner<'a>(&'a mut Receiver<ChunkCommand>);
-
-#[cfg(not(target_family = "wasm"))]
-impl<DL, V, M> SchedulerRunner<Scheduler<DL, V, M>> for SignalRunner<'_>
-where
-    DL: CellDataProvider + HeaderProvider + ExtensionProvider + Send + Sync + Clone + 'static,
-    V: Send + Clone + 'static,
-    M: DefaultMachineRunner + Send + 'static,
-{
-    async fn run(
-        &mut self,
-        mut scheduler: Scheduler<DL, V, M>,
-        max_cycles: Cycle,
-    ) -> Result<Option<TerminatedResult>, VMInternalError> {
-        let mut pause = VMPause::new();
-        let child_pause = pause.clone();
-        let (finish_tx, mut finish_rx) =
-            oneshot::channel::<Result<TerminatedResult, ckb_vm::Error>>();
-
-        let (child_tx, mut child_rx) = watch::channel(ChunkCommand::Resume);
-        let jh = tokio::spawn(async move {
-            child_rx.mark_changed();
-            loop {
-                let pause_cloned = child_pause.clone();
-                let _ = child_rx.changed().await;
-                match *child_rx.borrow() {
-                    ChunkCommand::Stop => {
-                        let exit = Err(ckb_vm::Error::External("stopped".into()));
-                        let _ = finish_tx.send(exit);
-                        return;
-                    }
-                    ChunkCommand::Suspend => {
-                        continue;
-                    }
-                    ChunkCommand::Resume => {
-                        let res = scheduler.run(RunMode::Pause(pause_cloned, max_cycles));
-                        match res {
-                            Err(VMInternalError::Pause) => {
-                                debug_assert!(
-                                    scheduler.consumed_cycles() <= max_cycles,
-                                    "Consumed cycles ({}) exceeded max_cycles ({})",
-                                    scheduler.consumed_cycles(),
-                                    max_cycles
-                                );
-                            }
-                            _ => {
-                                let _ = finish_tx.send(res);
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        loop {
-            tokio::select! {
-                Ok(_) = self.0.changed() => {
-                    let command = self.0.borrow().to_owned();
-                    match command {
-                        ChunkCommand::Suspend => {
-                            pause.interrupt();
-                        }
-                        ChunkCommand::Stop => {
-                            pause.interrupt();
-                            let _ = child_tx.send(command);
-                        }
-                        ChunkCommand::Resume => {
-                            pause.free();
-                            let _ = child_tx.send(command);
-                        }
-                    }
-                }
-                Ok(res) = &mut finish_rx => {
-                    let _ = jh.await;
-                    return res.map(Some);
-                }
-                else => { return Err(VMInternalError::External("stopped".into())); }
-            }
-        }
     }
 }
 

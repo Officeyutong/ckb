@@ -1965,7 +1965,6 @@ dependencies = [
  "ckb-verification-traits",
  "derive_more 1.0.0",
  "lru",
- "tokio",
 ]
 
 [[package]]
