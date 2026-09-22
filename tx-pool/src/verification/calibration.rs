@@ -108,15 +108,12 @@ impl Measurement {
     }
 }
 
-static VM_TIMING: LazyLock<VmTiming> = LazyLock::new(|| {
+static VM_TIMING: LazyLock<Option<VmTiming>> = LazyLock::new(|| {
     let timing = match Measurement::measure() {
         Ok(sample) => VmTiming::from_sample(sample),
         Err(error) => {
             ckb_logger::warn!("VM calibration failed; using the network time cap: {error}");
-            return VmTiming {
-                cycles_per_ms: 1,
-                minimum: Duration::MAX,
-            };
+            return None;
         }
     };
     ckb_logger::info!(
@@ -124,7 +121,7 @@ static VM_TIMING: LazyLock<VmTiming> = LazyLock::new(|| {
         timing.cycles_per_ms,
         timing.minimum.as_millis(),
     );
-    timing
+    Some(timing)
 });
 
 /// Calibrate before the pool accepts work; reuse the process-wide result.
@@ -133,7 +130,9 @@ pub(crate) fn initialize() {
 }
 
 pub(crate) fn for_cycles(cycles: u64, cap: Duration) -> Duration {
-    VM_TIMING.limit(cycles, cap)
+    VM_TIMING
+        .as_ref()
+        .map_or(cap, |timing| timing.limit(cycles, cap))
 }
 
 struct VmTiming {
