@@ -115,8 +115,6 @@ pub enum RPCError {
     PoolRejectedRBF = -1111,
     /// (-1112): The transaction is rejected for ref cell consuming.
     PoolRejectedInvalidated = -1112,
-    /// (-1113): Network verification exceeded this node's local time budget.
-    PoolRejectedTransactionByVerifyTimeLimit = -1113,
     /// (-1200): The indexer error.
     Indexer = -1200,
 }
@@ -182,8 +180,7 @@ impl RPCError {
             Reject::ExceededMaximumAncestorsCount => {
                 RPCError::PoolRejectedTransactionByMaxAncestorsCountLimit
             }
-            Reject::Full(_) => RPCError::PoolIsFull,
-            Reject::ExcessiveVerifyTime => RPCError::PoolRejectedTransactionByVerifyTimeLimit,
+            Reject::Full(_) | Reject::ExcessiveVerifyTime => RPCError::PoolIsFull,
             Reject::Duplicated(_) => RPCError::PoolRejectedDuplicatedTransaction,
             Reject::Malformed(_, _) => RPCError::PoolRejectedMalformedTransaction,
             Reject::DeclaredWrongCycles(..) => RPCError::PoolRejectedMalformedTransaction,
