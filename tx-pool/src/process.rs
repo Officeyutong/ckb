@@ -553,7 +553,7 @@ impl TxPoolService {
                             tx_hash,
                         });
                     }
-                    Err(Reject::ExcessiveVerifyTime) => {
+                    Err(reject) if reject.is_verification_interrupted() => {
                         // Proposal deliveries have no peer metadata. Release
                         // their known marker too so a later attempt can retry.
                         self.send_result_to_relayer(TxVerificationResult::Reject { tx_hash });

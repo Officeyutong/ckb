@@ -16,6 +16,33 @@ use ckb_types::{
 };
 use tempfile::TempDir;
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopped_verification_is_retryable_without_a_persistent_rejection() {
+    let rtx = program_transaction(
+        ScriptVersion::V0,
+        &[include_bytes!("../../../script/testdata/always_success")],
+    );
+    let snapshot = snapshot(Arc::new(ConsensusBuilder::default().build()));
+    let env = Arc::new(TxVerifyEnv::new_submit(snapshot.tip_header()));
+    let (_commands, mut command_rx) = watch::channel(ChunkCommand::Stop);
+    let reject = verify_rtx(
+        snapshot,
+        rtx,
+        env,
+        &None,
+        u64::MAX,
+        Some(&mut command_rx),
+        Some(Duration::from_secs(1)),
+    )
+    .await
+    .unwrap_err();
+    assert!(reject.is_verification_interrupted(), "{reject:?}");
+    assert!(!reject.is_malformed_tx(), "{reject:?}");
+    assert!(reject.is_allowed_relay(), "{reject:?}");
+    assert!(!reject.should_recorded(), "{reject:?}");
+    assert!(ckb_jsonrpc_types::PoolTransactionReject::try_from(reject).is_err());
+}
+
 #[test]
 fn time_budget_refusal_is_retryable_and_not_a_persistent_rejection() {
     let reject = Reject::ExcessiveVerifyTime;

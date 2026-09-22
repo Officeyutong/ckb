@@ -525,23 +525,32 @@ async fn notify_tx_notifies_relayer_when_verify_queue_is_full() {
 }
 
 #[tokio::test]
-async fn relay_and_proposal_budget_refusals_release_the_known_marker() {
+async fn interrupted_relay_and_proposal_verification_releases_without_recording() {
     let (service, receiver) = service_with_relay_receiver();
     let snapshot = service.tx_pool.read().await.cloned_snapshot();
     let tx = build_tx(vec![(&H256([1; 32]).into(), 0)], 1);
-    for remote in [Some((1, 1.into())), None] {
-        service
-            .after_process(
-                tx.clone(),
-                remote,
-                &snapshot,
-                &Err(crate::error::Reject::ExcessiveVerifyTime),
-            )
-            .await;
-        assert!(matches!(
-            receiver.try_recv().expect("budget refusal must release the known marker"),
-            TxVerificationResult::Reject { tx_hash } if tx_hash == tx.hash()
-        ));
+    let tmp = tempfile::tempdir().unwrap();
+    service.tx_pool.write().await.recent_reject =
+        Some(crate::component::recent_reject::RecentReject::build(tmp.path(), 1, 10, -1).unwrap());
+    for reject in [
+        crate::error::Reject::ExcessiveVerifyTime,
+        crate::error::Reject::Verification(
+            ckb_script::ScriptError::Interrupts.unknown_source().into(),
+        ),
+    ] {
+        for remote in [Some((1, 1.into())), None] {
+            service
+                .after_process(tx.clone(), remote, &snapshot, &Err(reject.clone()))
+                .await;
+            assert!(matches!(
+                receiver.try_recv().expect("interrupted verification must release the known marker"),
+                TxVerificationResult::Reject { tx_hash } if tx_hash == tx.hash()
+            ));
+        }
     }
     assert!(receiver.try_recv().is_err(), "one completion per attempt");
+    let pool = service.tx_pool.read().await;
+    let recent = pool.recent_reject.as_ref().unwrap();
+    assert!(recent.get(&tx.hash()).unwrap().is_none());
+    assert_eq!(recent.get_estimate_total_keys_num(), 0);
 }

@@ -180,11 +180,22 @@ impl RPCError {
             Reject::ExceededMaximumAncestorsCount => {
                 RPCError::PoolRejectedTransactionByMaxAncestorsCountLimit
             }
-            Reject::Full(_) | Reject::ExcessiveVerifyTime => RPCError::PoolIsFull,
+            Reject::Full(_) => RPCError::PoolIsFull,
+            Reject::ExcessiveVerifyTime => {
+                // Local submissions never use the network verification budget.
+                return Self::custom_with_data(
+                    Self::CKBInternalError,
+                    "local submission unexpectedly exhausted a network verification budget",
+                    reject,
+                );
+            }
             Reject::Duplicated(_) => RPCError::PoolRejectedDuplicatedTransaction,
             Reject::Malformed(_, _) => RPCError::PoolRejectedMalformedTransaction,
             Reject::DeclaredWrongCycles(..) => RPCError::PoolRejectedMalformedTransaction,
             Reject::Resolve(_) => RPCError::TransactionFailedToResolve,
+            Reject::Verification(error) if reject.is_verification_interrupted() => {
+                return Self::from_ckb_error(error.clone());
+            }
             Reject::Verification(_) => RPCError::TransactionFailedToVerify,
             Reject::RBFRejected(_) => RPCError::PoolRejectedRBF,
             Reject::Invalidated(_) => RPCError::PoolRejectedInvalidated,

@@ -6978,7 +6978,7 @@ An enum value from one of:
   - `LowFeeRate` :  Transaction fee lower than config
   - `ExceededMaximumAncestorsCount` :  Transaction exceeded maximum ancestors count limit
   - `ExceededTransactionSizeLimit` :  Transaction exceeded maximum size limit
-  - `Full` :  The pool's resource limits were exceeded
+  - `Full` :  The transaction pool is full
   - `Duplicated` :  Transaction already exists in transaction_pool
   - `Malformed` :  Malformed transaction
   - `DeclaredWrongCycles` :  Declared wrong cycles
