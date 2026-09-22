@@ -61,62 +61,7 @@ impl VmRunner<'_> {
                     });
             }
 
-            let limit = self.remaining;
-            let pause = Pause::new();
-            let child_pause = pause.clone();
-            let (started, start) = oneshot::channel();
-            let mut child = VmTask {
-                pause,
-                handle: tokio::spawn(async move {
-                    let now = Instant::now();
-                    let _ = started.send(now);
-                    let run = || execute(child_pause);
-                    // Leave the runtime free to poll network deadlines even
-                    // when every async worker is executing a VM.
-                    let result = if limit.is_some() {
-                        tokio::task::block_in_place(run)
-                    } else {
-                        run()
-                    };
-                    (execute, result, now.elapsed())
-                }),
-            };
-            // The deadline starts inside the task, excluding time in its queue.
-            // It belongs to this slice and cannot interrupt a later resume.
-            let deadline = async move {
-                match start
-                    .await
-                    .ok()
-                    .and_then(|started| limit.and_then(|limit| started.checked_add(limit)))
-                {
-                    Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
-                    None => std::future::pending().await,
-                }
-            }
-            .fuse();
-            tokio::pin!(deadline);
-            let completed = loop {
-                tokio::select! {
-                    biased;
-                    result = &mut child.handle => break result,
-                    _ = &mut deadline => {
-                        child.pause.interrupt();
-                    }
-                    changed = self.command.changed(), if desired != ChunkCommand::Stop => {
-                        desired = changed.map_or(ChunkCommand::Stop, |_| {
-                            self.command.borrow_and_update().clone()
-                        });
-                        if desired != ChunkCommand::Resume {
-                            child.pause.interrupt();
-                        }
-                    }
-                }
-            };
-            let (returned, result, elapsed) = match completed {
-                Ok(completed) => completed,
-                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-                Err(_) => return Err(Error::External("stopped".into())),
-            };
+            let (returned, result, elapsed) = self.run_slice(execute, &mut desired).await?;
             execute = returned;
             if let Some(remaining) = &mut self.remaining {
                 *remaining = remaining.saturating_sub(elapsed);
@@ -127,6 +72,73 @@ impl VmRunner<'_> {
             if !matches!(result, Err(Error::Pause)) {
                 return result.map(Some);
             }
+        }
+    }
+
+    /// Own one execution slice through interruption and join. Its returned time
+    /// covers only the child execution, and its deadline cannot affect a resume.
+    async fn run_slice<F>(
+        &mut self,
+        mut execute: F,
+        desired: &mut ChunkCommand,
+    ) -> Result<(F, Result<TerminatedResult, Error>, Duration), Error>
+    where
+        F: FnMut(Pause) -> Result<TerminatedResult, Error> + Send + 'static,
+    {
+        let limit = self.remaining;
+        let pause = Pause::new();
+        let child_pause = pause.clone();
+        let (started, start) = oneshot::channel();
+        let mut child = VmTask {
+            pause,
+            handle: tokio::spawn(async move {
+                let now = Instant::now();
+                let _ = started.send(now);
+                let run = || execute(child_pause);
+                // Leave the runtime free to poll network deadlines even
+                // when every async worker is executing a VM.
+                let result = if limit.is_some() {
+                    tokio::task::block_in_place(run)
+                } else {
+                    run()
+                };
+                (execute, result, now.elapsed())
+            }),
+        };
+        // The deadline starts inside the task, excluding time in its queue.
+        let deadline = async move {
+            match start
+                .await
+                .ok()
+                .and_then(|started| limit.and_then(|limit| started.checked_add(limit)))
+            {
+                Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                None => std::future::pending().await,
+            }
+        }
+        .fuse();
+        tokio::pin!(deadline);
+        let completed = loop {
+            tokio::select! {
+                biased;
+                result = &mut child.handle => break result,
+                _ = &mut deadline => {
+                    child.pause.interrupt();
+                }
+                changed = self.command.changed(), if *desired != ChunkCommand::Stop => {
+                    *desired = changed.map_or(ChunkCommand::Stop, |_| {
+                        self.command.borrow_and_update().clone()
+                    });
+                    if *desired != ChunkCommand::Resume {
+                        child.pause.interrupt();
+                    }
+                }
+            }
+        };
+        match completed {
+            Ok(completed) => Ok(completed),
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(_) => Err(Error::External("stopped".into())),
         }
     }
 }
