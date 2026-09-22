@@ -148,15 +148,24 @@ where
         command_rx: &mut tokio::sync::watch::Receiver<ChunkCommand>,
     ) -> Result<Cycle, Error> {
         match self.cached_cycles {
-            Some(cycles) if cycles <= max_cycles => Ok(cycles),
-            Some(_) => Err(ScriptError::ExceededMaximumCycles(max_cycles)
-                .unknown_source()
-                .into()),
+            Some(_) => self.verify(max_cycles),
             None => {
                 self.inner
                     .resumable_verify_with_signal(max_cycles, command_rx)
                     .await
             }
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    async fn verify_with_runner(
+        &self,
+        max_cycles: Cycle,
+        runner: &mut impl SchedulerRunner<Scheduler<DL, DebugPrinter, Machine>>,
+    ) -> Result<Option<Cycle>, Error> {
+        match self.cached_cycles {
+            Some(_) => self.verify(max_cycles).map(Some),
+            None => self.inner.verify_with_runner(max_cycles, runner).await,
         }
     }
 }
@@ -258,15 +267,7 @@ where
             self.time_relative.verify()?;
             self.capacity.verify()?;
             let fee = self.fee_calculator.transaction_fee()?;
-            let cycles = match self.script.cached_cycles {
-                Some(_) => Some(self.script.verify(max_cycles)?),
-                None => {
-                    self.script
-                        .inner
-                        .verify_with_runner(max_cycles, runner)
-                        .await?
-                }
-            };
+            let cycles = self.script.verify_with_runner(max_cycles, runner).await?;
             Ok(cycles.map(|cycles| Completed { cycles, fee }))
         }
     }
