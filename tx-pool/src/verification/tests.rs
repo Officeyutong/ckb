@@ -59,7 +59,7 @@ async fn network_budget_refusal_does_not_prevent_unbudgeted_verification() {
     )
     .await
     .expect("RPC verification has no network time budget");
-    let recovered = verify_rtx(
+    let queued_local = verify_rtx(
         Arc::clone(&snapshot),
         Arc::clone(&rtx),
         Arc::clone(&tx_env),
@@ -69,7 +69,7 @@ async fn network_budget_refusal_does_not_prevent_unbudgeted_verification() {
         None,
     )
     .await
-    .expect("queued local recovery has no network time budget");
+    .expect("queued local submission has no network time budget");
     let network = verify_rtx(
         snapshot,
         rtx,
@@ -82,7 +82,7 @@ async fn network_budget_refusal_does_not_prevent_unbudgeted_verification() {
     .await
     .expect("a later network attempt can verify normally");
     assert!(local.cycles > 0);
-    assert_eq!(local, recovered);
+    assert_eq!(local, queued_local);
     assert_eq!(local, network);
 }
 
@@ -119,7 +119,7 @@ async fn dao_lock_size_is_checked_before_every_script_verification_route() {
     let env = Arc::new(TxVerifyEnv::new_submit(snapshot.tip_header()));
     let (_sender, mut commands) = watch::channel(ChunkCommand::Resume);
     // Invalid scripts and an exhausted budget must not hide the cheap DAO error.
-    // Cover RPC, queued recovery, queued network and direct orphan verification.
+    // Cover RPC, queued local, queued network and direct orphan verification.
     for limit in [None, Some(Duration::ZERO)] {
         for command_rx in [None, Some(&mut commands)] {
             let error = verify_rtx(

@@ -4,7 +4,7 @@ use crate::{Net, Node, Spec};
 use ckb_network::SupportProtocols;
 use ckb_types::{
     bytes::Bytes,
-    core::{Capacity, ScriptHashType, capacity_bytes},
+    core::{Capacity, Cycle, ScriptHashType, TransactionView, capacity_bytes},
     packed::{
         BlockProposal, Byte32, CellDep, CellInput, CellOutput, OutPoint, RelayMessage,
         RelayMessageUnion, RelayTransactionHashes, Script,
@@ -39,77 +39,8 @@ impl Spec for NetworkVerificationTimeBudget {
 
     fn run(&self, nodes: &mut Vec<Node>) {
         let node = &nodes[0];
-        node.mine_until_out_bootstrap_period();
-        // Four cellbase rewards fund the 64 output cells.
-        node.mine(4);
-        let tip = node.get_tip_block_number();
+        let (funding, tx, cycles) = fund_budget_workload(node);
         let rpc = node.rpc_client();
-        let code_hash = CellOutput::calc_data_hash(&Bytes::from(std::fs::read(PROGRAM).unwrap()));
-        let genesis = &node.consensus().genesis_block().transactions()[0];
-        let index = genesis
-            .outputs_data()
-            .into_iter()
-            .position(|data| CellOutput::calc_data_hash(&data.raw_data()) == code_hash)
-            .expect("the workload is a genesis system cell");
-        let dep = CellDep::new_builder()
-            .out_point(OutPoint::new(genesis.hash(), index as u32))
-            .build();
-
-        // Distinct groups each execute the existing 4,096-syscall fixture.
-        // Together they comfortably exceed 1 ms while remaining consensus-valid.
-        let outputs = (0u8..64)
-            .map(|group| {
-                CellOutput::new_builder()
-                    .capacity(capacity_bytes!(100))
-                    .lock(node.always_success_script())
-                    .type_(Some(
-                        Script::new_builder()
-                            .code_hash(code_hash.clone())
-                            .hash_type(ScriptHashType::Data1)
-                            .args(Bytes::from(vec![group]))
-                            .build(),
-                    ))
-                    .build()
-            })
-            .collect();
-        let funding = node
-            .new_transaction_spend_tip_cellbase()
-            .as_advanced_builder()
-            .set_inputs(
-                (tip - 3..=tip)
-                    .map(|height| {
-                        let cellbase = node.get_block_by_number(height).transactions()[0].hash();
-                        CellInput::new(OutPoint::new(cellbase, 0), 0)
-                    })
-                    .collect(),
-            )
-            .set_outputs(vec![
-                CellOutput::new_builder()
-                    .capacity(capacity_bytes!(6_500))
-                    .lock(node.always_success_script())
-                    .build(),
-            ])
-            .build();
-        node.submit_transaction(&funding);
-        let tx = funding
-            .as_advanced_builder()
-            .set_inputs(vec![CellInput::new(OutPoint::new(funding.hash(), 0), 0)])
-            .cell_dep(dep)
-            .set_outputs(outputs)
-            .set_outputs_data(vec![Bytes::new().pack(); 64])
-            .build();
-        // Dry-run against the pool so the uncommitted parent resolves. This
-        // verifies scripts without admitting the transaction or caching cycles.
-        let cycles = rpc
-            .inner()
-            .test_tx_pool_accept(tx.data().into(), Some("passthrough".into()))
-            .expect("the workload is valid with its parent in the pool")
-            .cycles
-            .value();
-        assert!(
-            cycles <= DIRECT_ORPHAN_CYCLES,
-            "the orphan must take the direct verification path"
-        );
         let mut net = Net::new(
             self.name(),
             node.consensus(),
@@ -175,6 +106,83 @@ impl Spec for NetworkVerificationTimeBudget {
             ckb_jsonrpc_types::Status::Committed
         );
     }
+}
+
+// Prepare a valid workload that takes the direct orphan route and exceeds the
+// test-only time cap. The dry-run resolves its parent without warming the cache.
+fn fund_budget_workload(node: &Node) -> (TransactionView, TransactionView, Cycle) {
+    node.mine_until_out_bootstrap_period();
+    // Four cellbase rewards fund the 64 output cells.
+    node.mine(4);
+    let tip = node.get_tip_block_number();
+    let rpc = node.rpc_client();
+    let code_hash = CellOutput::calc_data_hash(&Bytes::from(std::fs::read(PROGRAM).unwrap()));
+    let genesis = &node.consensus().genesis_block().transactions()[0];
+    let index = genesis
+        .outputs_data()
+        .into_iter()
+        .position(|data| CellOutput::calc_data_hash(&data.raw_data()) == code_hash)
+        .expect("the workload is a genesis system cell");
+    let dep = CellDep::new_builder()
+        .out_point(OutPoint::new(genesis.hash(), index as u32))
+        .build();
+
+    // Distinct groups each execute the existing 4,096-syscall fixture.
+    // Together they comfortably exceed 1 ms while remaining consensus-valid.
+    let outputs = (0u8..64)
+        .map(|group| {
+            CellOutput::new_builder()
+                .capacity(capacity_bytes!(100))
+                .lock(node.always_success_script())
+                .type_(Some(
+                    Script::new_builder()
+                        .code_hash(code_hash.clone())
+                        .hash_type(ScriptHashType::Data1)
+                        .args(Bytes::from(vec![group]))
+                        .build(),
+                ))
+                .build()
+        })
+        .collect();
+    let funding = node
+        .new_transaction_spend_tip_cellbase()
+        .as_advanced_builder()
+        .set_inputs(
+            (tip - 3..=tip)
+                .map(|height| {
+                    let cellbase = node.get_block_by_number(height).transactions()[0].hash();
+                    CellInput::new(OutPoint::new(cellbase, 0), 0)
+                })
+                .collect(),
+        )
+        .set_outputs(vec![
+            CellOutput::new_builder()
+                .capacity(capacity_bytes!(6_500))
+                .lock(node.always_success_script())
+                .build(),
+        ])
+        .build();
+    node.submit_transaction(&funding);
+    let tx = funding
+        .as_advanced_builder()
+        .set_inputs(vec![CellInput::new(OutPoint::new(funding.hash(), 0), 0)])
+        .cell_dep(dep)
+        .set_outputs(outputs)
+        .set_outputs_data(vec![Bytes::new().pack(); 64])
+        .build();
+    // Dry-run against the pool so the uncommitted parent resolves. This
+    // verifies scripts without admitting the transaction or caching cycles.
+    let cycles = rpc
+        .inner()
+        .test_tx_pool_accept(tx.data().into(), Some("passthrough".into()))
+        .expect("the workload is valid with its parent in the pool")
+        .cycles
+        .value();
+    assert!(
+        cycles <= DIRECT_ORPHAN_CYCLES,
+        "the orphan must take the direct verification path"
+    );
+    (funding, tx, cycles)
 }
 
 fn assert_network_refusal(net: &Net, node: &Node, tx_hash: &Byte32) {

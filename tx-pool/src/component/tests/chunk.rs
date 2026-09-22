@@ -29,12 +29,12 @@ const MAX_TX_VERIFY_CYCLES: u64 = 70_000_000;
 const UNUSED_SNAPSHOT_COLUMNS: u32 = 1;
 
 #[test]
-fn verify_queue_preserves_network_origin_without_budgeting_local_recovery() {
+fn verify_queue_preserves_proposal_and_relay_origin() {
     let mut queue = VerifyQueue::new(MAX_TX_VERIFY_CYCLES);
-    let recovery = build_tx(vec![(&H256([1; 32]).into(), 0)], 1);
+    let local = build_tx(vec![(&H256([1; 32]).into(), 0)], 1);
     let proposal = build_tx(vec![(&H256([2; 32]).into(), 0)], 1);
     let relay = build_tx(vec![(&H256([3; 32]).into(), 0)], 1);
-    queue.add_tx(recovery.clone(), false, None).unwrap();
+    queue.add_tx(local.clone(), false, None).unwrap();
     queue.add_tx(proposal.clone(), true, None).unwrap();
     queue
         .add_tx(relay.clone(), false, Some((1, 1.into())))
@@ -44,9 +44,9 @@ fn verify_queue_preserves_network_origin_without_budgeting_local_recovery() {
     assert_eq!(proposed.tx, proposal);
     assert!(proposed.is_proposal);
     assert!(proposed.remote.is_none());
-    let recovered = queue.remove_tx_by_hash(&recovery.hash()).unwrap();
-    assert!(!recovered.is_proposal);
-    assert!(recovered.remote.is_none());
+    let local = queue.remove_tx_by_hash(&local.hash()).unwrap();
+    assert!(!local.is_proposal);
+    assert!(local.remote.is_none());
     let relayed = queue.pop_front(false).unwrap();
     assert_eq!(relayed.tx, relay);
     assert!(!relayed.is_proposal);
