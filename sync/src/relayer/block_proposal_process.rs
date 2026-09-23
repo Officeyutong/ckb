@@ -1,16 +1,26 @@
 use crate::relayer::Relayer;
 use crate::{Status, StatusCode};
 use ckb_logger::warn_target;
+use ckb_network::PeerIndex;
 use ckb_types::{core, packed, prelude::*};
 
 pub struct BlockProposalProcess<'a> {
     message: packed::BlockProposalReader<'a>,
     relayer: &'a Relayer,
+    peer: PeerIndex,
 }
 
 impl<'a> BlockProposalProcess<'a> {
-    pub fn new(message: packed::BlockProposalReader<'a>, relayer: &'a Relayer) -> Self {
-        BlockProposalProcess { message, relayer }
+    pub fn new(
+        message: packed::BlockProposalReader<'a>,
+        relayer: &'a Relayer,
+        peer: PeerIndex,
+    ) -> Self {
+        BlockProposalProcess {
+            message,
+            relayer,
+            peer,
+        }
     }
 
     pub async fn execute(self) -> Status {
@@ -71,7 +81,7 @@ impl<'a> BlockProposalProcess<'a> {
         }
 
         let tx_pool = self.relayer.shared.shared().tx_pool_controller();
-        if let Err(err) = tx_pool.notify_txs_async(asked_txs).await {
+        if let Err(err) = tx_pool.notify_txs_async(asked_txs, Some(self.peer)).await {
             warn_target!(
                 crate::LOG_TARGET_RELAY,
                 "BlockProposal notify_txs error: {:?}",

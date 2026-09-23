@@ -120,7 +120,7 @@ pub(crate) enum Message {
     RemoveLocalTx(Request<Byte32, bool>),
     TestAcceptTx(Request<TransactionView, TestAcceptTxResult>),
     SubmitRemoteTx(Request<(TransactionView, Cycle, PeerIndex), ()>),
-    NotifyTxs(Notify<Vec<TransactionView>>),
+    NotifyTxs(Notify<(Vec<TransactionView>, Option<PeerIndex>)>),
     FreshProposalsFilter(AsyncRequest<Vec<ProposalShortId>, Vec<ProposalShortId>>),
     FetchTxs(AsyncRequest<HashSet<ProposalShortId>, HashMap<ProposalShortId, TransactionView>>),
     FetchTxsWithCycles(AsyncRequest<HashSet<Byte32>, FetchTxsWithCyclesResult>),
@@ -285,13 +285,27 @@ impl TxPoolController {
     }
 
     /// Receive txs from network, try to add txs to tx-pool
-    pub fn notify_txs(&self, txs: Vec<TransactionView>) -> Result<(), AnyError> {
-        send_notify!(self, NotifyTxs, txs)
+    ///
+    /// `remote` is the peer that supplied the transactions, when known. It is
+    /// used to attribute malformed transactions so the peer can be penalized.
+    pub fn notify_txs(
+        &self,
+        txs: Vec<TransactionView>,
+        remote: Option<PeerIndex>,
+    ) -> Result<(), AnyError> {
+        send_notify!(self, NotifyTxs, (txs, remote))
     }
 
     /// Receive txs from network, try to add txs to tx-pool
-    pub async fn notify_txs_async(&self, txs: Vec<TransactionView>) -> Result<(), AnyError> {
-        let notify = Notify::new(txs);
+    ///
+    /// `remote` is the peer that supplied the transactions, when known. It is
+    /// used to attribute malformed transactions so the peer can be penalized.
+    pub async fn notify_txs_async(
+        &self,
+        txs: Vec<TransactionView>,
+        remote: Option<PeerIndex>,
+    ) -> Result<(), AnyError> {
+        let notify = Notify::new((txs, remote));
         self.sender
             .try_send(Message::NotifyTxs(notify))
             .map_err(|e| {
@@ -863,9 +877,11 @@ async fn process(mut service: TxPoolService, message: Message) {
                 error!("Responder sending submit_tx result failed {:?}", e);
             };
         }
-        Message::NotifyTxs(Notify { arguments: txs }) => {
+        Message::NotifyTxs(Notify {
+            arguments: (txs, remote),
+        }) => {
             for tx in txs {
-                let _ret = service.notify_tx(tx).await;
+                let _ret = service.notify_tx(tx, remote).await;
             }
         }
         Message::FreshProposalsFilter(AsyncRequest {
