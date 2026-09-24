@@ -36,7 +36,7 @@ where
 async fn async_network_controller_calls_fail_fast_when_channel_is_full() {
     let controller = full_controller();
 
-    assert_fast_error(controller.notify_txs_async(Vec::new(), None)).await;
+    assert_fast_error(controller.notify_remote_txs_async(Vec::new(), 1.into())).await;
     assert_fast_error(controller.fresh_proposals_filter(Vec::new())).await;
     assert_fast_error(controller.fetch_txs(HashSet::new())).await;
     assert_fast_error(controller.fetch_txs_with_cycles(HashSet::new())).await;

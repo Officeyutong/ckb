@@ -81,7 +81,7 @@ impl<'a> BlockProposalProcess<'a> {
         }
 
         let tx_pool = self.relayer.shared.shared().tx_pool_controller();
-        if let Err(err) = tx_pool.notify_txs_async(asked_txs, Some(self.peer)).await {
+        if let Err(err) = tx_pool.notify_remote_txs_async(asked_txs, self.peer).await {
             warn_target!(
                 crate::LOG_TARGET_RELAY,
                 "BlockProposal notify_txs error: {:?}",

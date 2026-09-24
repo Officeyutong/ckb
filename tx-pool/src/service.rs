@@ -284,28 +284,21 @@ impl TxPoolController {
         send_message!(self, SubmitRemoteTx, (tx, declared_cycles, peer))
     }
 
-    /// Receive txs from network, try to add txs to tx-pool
-    ///
-    /// `remote` is the peer that supplied the transactions, when known. It is
-    /// used to attribute malformed transactions so the peer can be penalized.
-    pub fn notify_txs(
-        &self,
-        txs: Vec<TransactionView>,
-        remote: Option<PeerIndex>,
-    ) -> Result<(), AnyError> {
-        send_notify!(self, NotifyTxs, (txs, remote))
+    /// Receive locally generated txs (no peer attribution), try to add txs to
+    /// tx-pool
+    pub fn notify_local_txs(&self, txs: Vec<TransactionView>) -> Result<(), AnyError> {
+        send_notify!(self, NotifyTxs, (txs, None))
     }
 
-    /// Receive txs from network, try to add txs to tx-pool
+    /// Receive txs from a remote peer, try to add txs to tx-pool
     ///
-    /// `remote` is the peer that supplied the transactions, when known. It is
-    /// used to attribute malformed transactions so the peer can be penalized.
-    pub async fn notify_txs_async(
+    /// The peer is carried so malformed transactions can be attributed to it.
+    pub async fn notify_remote_txs_async(
         &self,
         txs: Vec<TransactionView>,
-        remote: Option<PeerIndex>,
+        peer: PeerIndex,
     ) -> Result<(), AnyError> {
-        let notify = Notify::new((txs, remote));
+        let notify = Notify::new((txs, Some(peer)));
         self.sender
             .try_send(Message::NotifyTxs(notify))
             .map_err(|e| {
