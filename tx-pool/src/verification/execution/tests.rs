@@ -423,3 +423,70 @@ async fn scheduler_state_and_cycles_survive_joined_pauses() {
         assert_eq!(actual.consumed_cycles, expected.consumed_cycles);
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn scheduler_resume_cannot_regrant_consumed_cycles() {
+    use super::super::tests::{program_transaction, snapshot};
+    use ckb_chain_spec::consensus::ConsensusBuilder;
+    use ckb_script::{ScriptVersion, TransactionScriptsVerifier};
+    use ckb_store::data_loader_wrapper::AsDataLoader;
+    use ckb_types::core::hardfork::HardForks;
+    use ckb_verification::TxVerifyEnv;
+    use std::sync::Arc;
+
+    let snapshot = snapshot(Arc::new(
+        ConsensusBuilder::default()
+            .hardfork_switch(HardForks::new_dev())
+            .build(),
+    ));
+    let env = Arc::new(TxVerifyEnv::new_submit(snapshot.tip_header()));
+    for version in [ScriptVersion::V0, ScriptVersion::V2] {
+        let programs: &[&[u8]] = if version == ScriptVersion::V2 {
+            &[
+                include_bytes!("../../../../script/testdata/spawn_caller_exec"),
+                include_bytes!("../../../../script/testdata/current_cycles"),
+            ]
+        } else {
+            &[include_bytes!("../../../../script/testdata/debugger")]
+        };
+        let verifier = TransactionScriptsVerifier::new(
+            program_transaction(version, programs),
+            snapshot.as_data_loader(),
+            snapshot.cloned_consensus(),
+            Arc::clone(&env),
+        );
+        let (_, group) = verifier.groups().next().unwrap();
+        let expected = verifier.detailed_run(group, u64::MAX).unwrap();
+        assert!(expected.consumed_cycles > 0);
+        for max_cycles in [expected.consumed_cycles - 1, expected.consumed_cycles] {
+            let mut scheduler = verifier.create_scheduler(group).unwrap();
+            scheduler.iterate().unwrap();
+            let consumed = scheduler.consumed_cycles();
+            assert!(consumed > 0);
+            if version == ScriptVersion::V2 {
+                // The root has yielded to its spawned VM: resumption must
+                // spend only the part of the total cap not already consumed.
+                assert!(!scheduler.terminated());
+                assert!(consumed < max_cycles);
+            } else {
+                // Keep the completed-scheduler regression, including the exact
+                // cap where zero remaining cycles must still allow success.
+                assert!(scheduler.terminated());
+                assert_eq!(consumed, expected.consumed_cycles);
+            }
+            let (_commands, mut receiver) = watch::channel(ChunkCommand::Resume);
+            let mut runner = VmRunner {
+                command: &mut receiver,
+                remaining: Some(TEST_TIMEOUT),
+            };
+            let result = runner.run(scheduler, max_cycles).await;
+            if max_cycles < expected.consumed_cycles {
+                assert!(matches!(result, Err(Error::CyclesExceeded)), "{result:?}");
+            } else {
+                let actual = result.unwrap().unwrap();
+                assert_eq!(actual.exit_code, expected.exit_code);
+                assert_eq!(actual.consumed_cycles, expected.consumed_cycles);
+            }
+        }
+    }
+}
