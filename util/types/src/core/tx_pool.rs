@@ -45,7 +45,7 @@ pub enum Reject {
     #[error("Declared wrong cycles {0}, actual {1}")]
     DeclaredWrongCycles(Cycle, Cycle),
 
-    /// Active VM verification exhausted this node's network transaction time budget.
+    /// Network verification exceeded this node's cumulative CKB-VM CPU-time limit.
     /// This is a retryable resource limit, not consensus invalidity.
     #[error("Transaction verification exceeded the local tx-pool time limit")]
     ExcessiveVerifyTime,
@@ -106,8 +106,8 @@ impl Reject {
         !matches!(self, Self::Duplicated(..)) && !self.is_verification_interrupted()
     }
 
-    /// A network time limit or node interruption stopped verification.
-    /// Network time exhaustion and node interruption are retryable; exceeding
+    /// A network CPU budget or node interruption stopped verification.
+    /// CPU budget exhaustion and node interruption are retryable; exceeding
     /// the consensus cycle limit is still an ordinary verification rejection.
     pub fn is_verification_interrupted(&self) -> bool {
         match self {

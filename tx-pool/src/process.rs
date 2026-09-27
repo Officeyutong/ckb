@@ -728,7 +728,7 @@ impl TxPoolService {
         tx: TransactionView,
         declared_cycles: Option<Cycle>,
         command_rx: Option<&mut watch::Receiver<ChunkCommand>>,
-        active_time_limit: Option<Duration>,
+        cpu_time_limit: Option<Duration>,
     ) -> Option<(Result<Completed, Reject>, Arc<Snapshot>)> {
         let verify_cache_key = VerifyCacheKey::from(&tx);
         let instant = Instant::now();
@@ -750,7 +750,7 @@ impl TxPoolService {
             &verify_cache,
             max_cycles,
             command_rx,
-            active_time_limit,
+            cpu_time_limit,
         )
         .await;
 

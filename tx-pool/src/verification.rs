@@ -1,6 +1,7 @@
-//! Canonical verification entry point and local time budgets for network transactions.
+//! Canonical verification entry point and local CPU budgets for network transactions.
 
 pub(crate) mod calibration;
+mod cpu_clock;
 mod execution;
 
 #[cfg(test)]
@@ -33,7 +34,7 @@ pub(crate) async fn verify_rtx(
     cache_entry: &Option<CachedScriptCycles>,
     max_tx_verify_cycles: Cycle,
     command_rx: Option<&mut watch::Receiver<ChunkCommand>>,
-    active_time_limit: Option<Duration>,
+    cpu_time_limit: Option<Duration>,
 ) -> Result<Completed, Reject> {
     let consensus = snapshot.cloned_consensus();
     let data_loader = snapshot.as_data_loader();
@@ -56,11 +57,11 @@ pub(crate) async fn verify_rtx(
         )
     };
 
-    match (command_rx, active_time_limit) {
+    match (command_rx, cpu_time_limit) {
         // RPC submissions keep the whole synchronous check off the async worker.
         (None, None) => block_in_place(|| new_verifier()?.verify(max_tx_verify_cycles, false))
             .map_err(Reject::Verification),
-        (command_rx, active_time_limit) => {
+        (command_rx, cpu_time_limit) => {
             let verifier = new_verifier().map_err(Reject::Verification)?;
             // Direct network orphans have a budget but no worker control channel.
             let mut resume_channel;
@@ -76,7 +77,7 @@ pub(crate) async fn verify_rtx(
                     max_tx_verify_cycles,
                     &mut execution::VmRunner {
                         command: command_rx,
-                        remaining: active_time_limit,
+                        remaining: cpu_time_limit,
                     },
                 )
                 .await

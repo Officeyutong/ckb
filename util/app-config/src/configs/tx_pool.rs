@@ -21,7 +21,7 @@ pub struct TxPoolConfig {
     pub min_rbf_rate: FeeRate,
     /// tx pool rejects txs that cycles greater than max_tx_verify_cycles
     pub max_tx_verify_cycles: Cycle,
-    /// Test-only override of the network verification time cap, in milliseconds.
+    /// Test-only override of the network verification CPU-time cap, in milliseconds.
     #[cfg(feature = "test")]
     #[doc(hidden)]
     pub max_tx_verify_time_ms: NonZeroU32,
@@ -49,7 +49,7 @@ pub struct TxPoolConfig {
 }
 
 impl TxPoolConfig {
-    /// Internal network verification cap; only test builds support an override.
+    /// Internal network verification CPU cap; only test builds support an override.
     pub fn max_tx_verify_time(&self) -> std::time::Duration {
         #[cfg(feature = "test")]
         {
