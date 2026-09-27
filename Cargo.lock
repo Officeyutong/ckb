@@ -1905,6 +1905,7 @@ dependencies = [
  "libc",
  "lru",
  "multi_index_map",
+ "nix 0.31.2",
  "rand 0.8.6",
  "rustc-hash 1.1.0",
  "sentry",

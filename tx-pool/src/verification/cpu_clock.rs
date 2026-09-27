@@ -4,6 +4,8 @@
 //! observes CPU progress while execution is active. Its readings can lag or include
 //! later work after execution returns; it must never bill or override the receipt.
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use nix::time::ClockId;
 use std::{io, marker::PhantomData, rc::Rc, time::Duration};
 
 /// A precise timestamp that cannot leave the thread it measures.
@@ -52,17 +54,11 @@ impl CpuMonitor {
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn read_posix_clock(clock: libc::clockid_t) -> io::Result<Duration> {
-    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
-    // SAFETY: time points to writable storage of the type required by the API.
-    if unsafe { libc::clock_gettime(clock, time.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: a successful clock_gettime initializes the complete timespec.
-    let time = unsafe { time.assume_init() };
+fn read_posix_clock(clock: ClockId) -> io::Result<Duration> {
+    let time = clock.now()?;
     Ok(Duration::new(
-        time.tv_sec.try_into().map_err(io::Error::other)?,
-        time.tv_nsec.try_into().map_err(io::Error::other)?,
+        time.tv_sec().try_into().map_err(io::Error::other)?,
+        time.tv_nsec().try_into().map_err(io::Error::other)?,
     ))
 }
 
@@ -71,10 +67,10 @@ mod platform {
     use super::*;
 
     pub(super) fn current_time() -> io::Result<Duration> {
-        read_posix_clock(libc::CLOCK_THREAD_CPUTIME_ID)
+        read_posix_clock(ClockId::CLOCK_THREAD_CPUTIME_ID)
     }
 
-    pub(super) struct ThreadClock(libc::clockid_t);
+    pub(super) struct ThreadClock(ClockId);
 
     impl ThreadClock {
         pub(super) fn current() -> io::Result<Self> {
@@ -84,7 +80,7 @@ mod platform {
             if error != 0 {
                 return Err(io::Error::from_raw_os_error(error));
             }
-            Ok(Self(clock))
+            Ok(Self(ClockId::from_raw(clock)))
         }
 
         pub(super) fn read(&self) -> io::Result<Duration> {
@@ -111,7 +107,7 @@ mod platform {
 
     pub(super) fn current_time() -> io::Result<Duration> {
         // Includes current CPU time not yet reflected in THREAD_BASIC_INFO.
-        read_posix_clock(libc::CLOCK_THREAD_CPUTIME_ID)
+        read_posix_clock(ClockId::CLOCK_THREAD_CPUTIME_ID)
     }
 
     pub(super) struct ThreadClock(libc::mach_port_t);
