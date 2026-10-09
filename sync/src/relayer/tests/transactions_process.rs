@@ -15,12 +15,7 @@ fn dedup_keeps_first_body_per_hash() {
     let other_hash = other.hash();
     assert_ne!(tx_hash, other_hash);
 
-    let deduped = dedup_transactions(vec![
-        (tx.clone(), 1),
-        (tx.clone(), 1),
-        (other, 2),
-        (tx, 3),
-    ]);
+    let deduped = dedup_transactions(vec![(tx.clone(), 1), (tx.clone(), 1), (other, 2), (tx, 3)]);
 
     assert_eq!(deduped.len(), 2);
     assert_eq!(deduped[0].0.hash(), tx_hash);
