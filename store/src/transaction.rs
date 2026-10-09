@@ -295,8 +295,14 @@ impl StoreTransaction {
         self.insert_raw(COLUMN_INDEX, block_hash.as_slice(), block_number.as_slice())
     }
 
-    /// Detaches a block from the main chain, removing its transaction and uncle indices.
+    /// Detaches a block from the main chain, removing its canonical indices.
     pub fn detach_block(&self, block: &BlockView) -> Result<(), Error> {
+        if block.epoch().index() == 0 {
+            // The replacement fork may not reach this epoch. Its index must disappear
+            // even when no attached epoch head overwrites it; retain the fork's data.
+            let epoch_number: packed::Uint64 = block.epoch().number().into();
+            self.delete(COLUMN_EPOCH, epoch_number.as_slice())?;
+        }
         for tx_hash in block.tx_hashes().iter() {
             self.delete(COLUMN_TRANSACTION_INFO, tx_hash.as_slice())?;
         }
