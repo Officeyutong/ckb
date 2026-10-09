@@ -18,7 +18,7 @@ fn dedup_keeps_first_body_per_hash() {
     let deduped = dedup_transactions(vec![
         (tx.clone(), 1),
         (tx.clone(), 1),
-        (other.clone(), 2),
+        (other, 2),
         (tx, 3),
     ]);
 
