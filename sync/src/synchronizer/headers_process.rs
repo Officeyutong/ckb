@@ -95,18 +95,16 @@ impl<'a> HeadersProcess<'a> {
         debug!("HeadersProcess begins");
         let shared: &SyncShared = self.synchronizer.shared();
         let consensus = shared.consensus();
-        let headers = self
-            .message
-            .headers()
-            .to_entity()
-            .into_iter()
-            .map(packed::Header::into_view)
-            .collect::<Vec<_>>();
-
+        let headers = self.message.headers();
         if headers.len() > MAX_HEADERS_LEN {
             warn!("HeadersProcess is oversized");
             return StatusCode::HeadersIsInvalid.with_context("oversize");
         }
+
+        let headers = headers
+            .iter()
+            .map(|header| header.to_entity().into_view())
+            .collect::<Vec<_>>();
 
         if headers.is_empty() {
             // Empty means that the other peer's tip may be consistent with our own best known,
