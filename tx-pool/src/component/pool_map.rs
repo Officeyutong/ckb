@@ -215,10 +215,12 @@ impl PoolMap {
         if self.entries.get_by_id(&tx_short_id).is_some() {
             return Ok((false, evicts));
         }
-        let (total_tx_size, total_tx_cycles) =
-            self.updated_stat_for_add_tx(entry.size, entry.cycles)?;
         trace!("pool_map.add_{:?} {}", status, entry.transaction().hash());
         evicts = self.check_and_record_ancestors(&mut entry)?;
+        // must be calculated after `check_and_record_ancestors`, since it may evict entries
+        // and update the stats, a snapshot taken before would discard those updates
+        let (total_tx_size, total_tx_cycles) =
+            self.updated_stat_for_add_tx(entry.size, entry.cycles)?;
         self.record_entry_edges(&entry)?;
         self.insert_entry(&entry, status);
         self.record_entry_descendants(&entry);
