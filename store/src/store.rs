@@ -23,6 +23,10 @@ use ckb_types::{
     prelude::*,
 };
 
+fn is_in_freezer(freezer: &Freezer, number: BlockNumber) -> bool {
+    number > 0 && number < freezer.number()
+}
+
 /// The `ChainStore` trait provides chain data store interface
 pub trait ChainStore: Send + Sync + Sized {
     /// Return cache reference
@@ -42,8 +46,7 @@ pub trait ChainStore: Send + Sync + Sized {
     fn get_block(&self, h: &packed::Byte32) -> Option<BlockView> {
         let header = self.get_block_header(h)?;
         if let Some(freezer) = self.freezer()
-            && header.number() > 0
-            && header.number() < freezer.number()
+            && is_in_freezer(freezer, header.number())
         {
             let raw_block = freezer.retrieve(header.number()).expect("block frozen")?;
             let raw_block_reader =
@@ -67,6 +70,43 @@ pub trait ChainStore: Send + Sync + Sized {
             BlockView::new_unchecked(header, uncles, body, proposals)
         };
         Some(block)
+    }
+
+    /// Get block header with the uncle hash and the extension of the block.
+    ///
+    /// Unlike [`ChainStore::get_block`], this does not load or deserialize the
+    /// block body and proposals. For blocks that have been moved to the
+    /// freezer, the uncle and extension metadata has been pruned from RocksDB,
+    /// so they are read from the frozen block without deserializing its
+    /// transactions.
+    fn get_block_header_with_uncles_and_extension(
+        &self,
+        h: &packed::Byte32,
+    ) -> Option<(HeaderView, packed::Byte32, Option<packed::Bytes>)> {
+        let header = self.get_block_header(h)?;
+        if let Some(freezer) = self.freezer()
+            && is_in_freezer(freezer, header.number())
+        {
+            let raw_block = freezer.retrieve(header.number()).expect("block frozen")?;
+            let raw_block_reader =
+                packed::BlockReader::from_compatible_slice(&raw_block).expect("checked data");
+            if raw_block_reader.calc_header_hash().as_slice() == h.as_slice() {
+                return Some((
+                    header,
+                    raw_block_reader.calc_uncles_hash(),
+                    raw_block_reader
+                        .extension()
+                        .map(|extension| extension.to_entity()),
+                ));
+            }
+        }
+
+        let uncles = self.get_block_uncles(h)?;
+        Some((
+            header,
+            uncles.data().calc_uncles_hash(),
+            self.get_block_extension(h),
+        ))
     }
 
     /// Get header by block header hash
@@ -319,8 +359,7 @@ pub trait ChainStore: Send + Sync + Sized {
     ) -> Option<(TransactionView, TransactionInfo)> {
         let tx_info = self.get_transaction_info(hash)?;
         if let Some(freezer) = self.freezer()
-            && tx_info.block_number > 0
-            && tx_info.block_number < freezer.number()
+            && is_in_freezer(freezer, tx_info.block_number)
         {
             let raw_block = freezer
                 .retrieve(tx_info.block_number)

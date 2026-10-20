@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use ckb_logger::{debug, error, info, trace, warn};
 use ckb_network::{CKBProtocolContext, CKBProtocolHandler, PeerIndex, async_trait, bytes::Bytes};
-use ckb_shared::Shared;
+use ckb_shared::{Shared, Snapshot};
 use ckb_store::ChainStore;
 use ckb_types::{core, packed, prelude::*};
 
@@ -32,6 +32,38 @@ impl LightClientProtocol {
     /// Create a new light client protocol handler.
     pub fn new(shared: Shared) -> Self {
         Self { shared }
+    }
+}
+
+/// The parts of a block needed to build a [`packed::VerifiableHeader`],
+/// excluding the parent chain root which depends on the MMR.
+pub(crate) struct VerifiableHeaderParts {
+    pub(crate) header: core::HeaderView,
+    pub(crate) uncles_hash: packed::Byte32,
+    pub(crate) extension: Option<packed::Bytes>,
+}
+
+impl VerifiableHeaderParts {
+    pub(crate) fn load(snapshot: &Snapshot, hash: &packed::Byte32) -> Option<Self> {
+        let (header, uncles_hash, extension) =
+            snapshot.get_block_header_with_uncles_and_extension(hash)?;
+        Some(Self {
+            header,
+            uncles_hash,
+            extension,
+        })
+    }
+
+    pub(crate) fn to_verifiable_header(
+        &self,
+        parent_chain_root: packed::HeaderDigest,
+    ) -> packed::VerifiableHeader {
+        packed::VerifiableHeader::new_builder()
+            .header(self.header.data())
+            .uncles_hash(self.uncles_hash.clone())
+            .extension(Pack::pack(&self.extension))
+            .parent_chain_root(parent_chain_root)
+            .build()
     }
 }
 
@@ -128,13 +160,12 @@ impl LightClientProtocol {
         let snapshot = self.shared.snapshot();
 
         let tip_hash = snapshot.tip_hash();
-        let tip_block = snapshot
-            .get_block(&tip_hash)
+        let tip_header_parts = VerifiableHeaderParts::load(&snapshot, &tip_hash)
             .expect("checked: tip block should be existed");
-        let parent_chain_root = if tip_block.is_genesis() {
+        let parent_chain_root = if tip_header_parts.header.is_genesis() {
             Default::default()
         } else {
-            let mmr = snapshot.chain_root_mmr(tip_block.number() - 1);
+            let mmr = snapshot.chain_root_mmr(tip_header_parts.header.number() - 1);
             match mmr.get_root() {
                 Ok(root) => root,
                 Err(err) => {
@@ -144,12 +175,7 @@ impl LightClientProtocol {
             }
         };
 
-        let tip_header = packed::VerifiableHeader::new_builder()
-            .header(tip_block.header().data())
-            .uncles_hash(tip_block.calc_uncles_hash())
-            .extension(Pack::pack(&tip_block.extension()))
-            .parent_chain_root(parent_chain_root)
-            .build();
+        let tip_header = tip_header_parts.to_verifiable_header(parent_chain_root);
 
         Ok(tip_header)
     }
@@ -182,7 +208,7 @@ impl LightClientProtocol {
         &self,
         peer: PeerIndex,
         nc: &Arc<dyn CKBProtocolContext + Sync>,
-        last_block: &core::BlockView,
+        last_header_parts: &VerifiableHeaderParts,
         items_positions: Vec<u64>,
         proved_items: <<T as Entity>::Builder as ProverMessageBuilder>::ProvedItems,
         missing_items: <<T as Entity>::Builder as ProverMessageBuilder>::MissingItems,
@@ -192,11 +218,11 @@ impl LightClientProtocol {
         <T as Entity>::Builder: ProverMessageBuilder,
         <<T as Entity>::Builder as Builder>::Entity: Into<packed::LightClientMessageUnion>,
     {
-        let (parent_chain_root, proof) = if last_block.is_genesis() {
+        let (parent_chain_root, proof) = if last_header_parts.header.is_genesis() {
             (Default::default(), Default::default())
         } else {
             let snapshot = self.shared.snapshot();
-            let mmr = snapshot.chain_root_mmr(last_block.number() - 1);
+            let mmr = snapshot.chain_root_mmr(last_header_parts.header.number() - 1);
             let parent_chain_root = match mmr.get_root() {
                 Ok(root) => root,
                 Err(err) => {
@@ -217,12 +243,7 @@ impl LightClientProtocol {
             };
             (parent_chain_root, proof)
         };
-        let verifiable_last_header = packed::VerifiableHeader::new_builder()
-            .header(last_block.data().header())
-            .uncles_hash(last_block.calc_uncles_hash())
-            .extension(Pack::pack(&last_block.extension()))
-            .parent_chain_root(parent_chain_root)
-            .build();
+        let verifiable_last_header = last_header_parts.to_verifiable_header(parent_chain_root);
         let content = T::new_builder()
             .set_last_header(verifiable_last_header)
             .set_proof(proof.into())

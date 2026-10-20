@@ -8,7 +8,7 @@ use ckb_network::{CKBProtocolContext, PeerIndex};
 use ckb_store::ChainStore;
 use ckb_types::{packed, prelude::*, utilities::CBMT};
 
-use crate::{LightClientProtocol, Status, StatusCode, constant};
+use crate::{LightClientProtocol, Status, StatusCode, VerifiableHeaderParts, constant};
 
 pub(crate) struct GetTransactionsProofProcess<'a> {
     message: packed::GetTransactionsProofReader<'a>,
@@ -61,8 +61,7 @@ impl<'a> GetTransactionsProofProcess<'a> {
                 .reply_tip_state::<packed::SendTransactionsProof>(self.peer, self.nc)
                 .await;
         }
-        let last_block = snapshot
-            .get_block(&last_block_hash)
+        let last_header_parts = VerifiableHeaderParts::load(&snapshot, &last_block_hash)
             .expect("block should be in store");
 
         let (found, missing): (Vec<_>, Vec<_>) = tx_hashes.into_iter().partition(|tx_hash| {
@@ -146,7 +145,7 @@ impl<'a> GetTransactionsProofProcess<'a> {
             .reply_proof::<packed::SendTransactionsProofV1>(
                 self.peer,
                 self.nc,
-                &last_block,
+                &last_header_parts,
                 positions,
                 proved_items,
                 missing_items,
