@@ -305,7 +305,10 @@ impl SchedulerRunner<Scheduler<DataLoaderWrapper<ChainDB>, DebugContext, Machine
         max_cycles: Cycle,
     ) -> Result<Option<TerminatedResult>, VMInternalError> {
         loop {
-            match scheduler.run(RunMode::Pause(ckb_vm::machine::Pause::new(), max_cycles)) {
+            let remaining = max_cycles
+                .checked_sub(scheduler.consumed_cycles())
+                .ok_or(VMInternalError::CyclesExceeded)?;
+            match scheduler.run(RunMode::Pause(ckb_vm::machine::Pause::new(), remaining)) {
                 Err(VMInternalError::Pause) => continue,
                 result => return result.map(Some),
             }

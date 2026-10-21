@@ -409,10 +409,18 @@ async fn check_spawn_async() {
 
     // The debug syscall pauses the spawned VM; resuming must preserve cycles.
     let cycles = verifier
-        .verify_with_runner(script_version, &rtx, Cycle::MAX)
+        .verify_with_runner(script_version, &rtx, cycles_once)
         .await
         .unwrap();
     assert_eq!(cycles, cycles_once);
+    let error = verifier
+        .verify_with_runner(script_version, &rtx, cycles_once - 1)
+        .await
+        .unwrap_err();
+    let expected: Error = ScriptError::ExceededMaximumCycles(cycles_once - 1)
+        .input_lock_script(0)
+        .into();
+    ckb_error::assert_error_eq!(error, expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
