@@ -113,7 +113,6 @@ where
     terminated_vms: BTreeMap<VmId, i8>,
     /// Root vm's arguments. Provided for compatibility with surrounding tools. You should not
     /// read it anywhere except when initializing the root vm.
-    /// Note: This field is intentionally not serialized in FullSuspendedState.
     root_vm_args: Vec<Bytes>,
 
     /// MessageBox is expected to be empty before returning from `run`
@@ -336,9 +335,8 @@ where
         }
     }
 
-    // This internal function is actually a wrapper over +iterate_inner+,
-    // it is split into a different function, so cycle calculation will be
-    // executed no matter what result +iterate_inner+ returns.
+    // Finalize VM iterations even on errors. External pauses preserve the
+    // unfinished iteration's IO charges in iterate_inner instead.
     #[inline]
     fn iterate_outer(
         &mut self,
@@ -346,6 +344,9 @@ where
         limit_cycles: Cycle,
     ) -> Result<(VmId, Cycle), Error> {
         let iterate_return = self.iterate_inner(pause.clone(), limit_cycles);
+        if matches!(iterate_return, Err(Error::Pause)) {
+            return Err(Error::Pause);
+        }
         self.consume_cycles(self.iteration_cycles)?;
         let remaining_cycles = limit_cycles
             .checked_sub(self.iteration_cycles)
@@ -369,8 +370,6 @@ where
         //
         // * Move `self.process_io` call to the very end of `iterate_outer` method, which is
         // exactly current location
-        // * For now we have to live with the fact that `iteration_cycles` will not always be
-        // zero at iteration boundaries, and also preserve its value in `FullSuspendedState`.
         //
         // One expected change is that +process_io+ is now called once more
         // after the whole scheduler terminates, and not called at the very beginning
@@ -385,9 +384,8 @@ where
     // Here both pause signal and limit_cycles are provided so as to simplify
     // branches.
     fn iterate_inner(&mut self, pause: Pause, limit_cycles: Cycle) -> Result<VmId, Error> {
-        // Execute the VM for real, consumed cycles in the virtual machine is
-        // moved over to +iteration_cycles+, then we reset virtual machine's own
-        // cycle count to zero.
+        // Take the VM's consumed cycles and reset its counter before accounting
+        // for either a completed iteration or an external pause.
         let (id, result, cycles) = {
             let (id, vm) = self.iterate_prepare_machine()?;
             vm.inner_mut().set_max_cycles(limit_cycles);
@@ -397,6 +395,16 @@ where
             vm.inner_mut().set_cycles(0);
             (id, result, cycles)
         };
+        if matches!(result, Err(Error::Pause)) {
+            // A pause is not a VM iteration boundary. Move only this VM's
+            // cycles to the shared base, keeping pending IO charges invisible
+            // to current_cycles until this VM yields or exits.
+            self.consume_cycles(cycles)?;
+            if cycles > limit_cycles || self.iteration_cycles > limit_cycles - cycles {
+                return Err(Error::CyclesExceeded);
+            }
+            return Err(Error::Pause);
+        }
         self.iteration_cycles = self
             .iteration_cycles
             .checked_add(cycles)
@@ -518,6 +526,7 @@ where
                     );
                 }
                 Message::Pipe(vm_id, args) => {
+                    // Note: In practice, the maximum number of pipes is MAX_FDS + 1.
                     if self.fds.len() as u64 >= MAX_FDS {
                         let (_, machine) = self.ensure_get_instantiated(&vm_id)?;
                         machine

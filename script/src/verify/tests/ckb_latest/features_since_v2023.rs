@@ -1363,4 +1363,62 @@ fn spawn_create_17_spawn() {
         .expect("verify");
 
     assert_eq!(cycles, 36445673);
+
+    // Interrupt at observable guest events, without relying on thread timing.
+    // This program swaps VMs during IO and prints current_cycles, so comparing
+    // the entire trace checks the historical syscall values as well as the total.
+    let run = |max_cycles: Cycle, interrupt: bool| {
+        verifier.verify_map(script_version, &rtx, |mut verifier| {
+            let pause = ckb_vm::machine::Pause::new();
+            let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let output = Arc::clone(&messages);
+            let signal = pause.clone();
+            verifier.syscall_context.debug_printer = Arc::new(move |_, message| {
+                output.lock().unwrap().push(message.to_owned());
+                if interrupt {
+                    signal.interrupt();
+                }
+            });
+            let (_, group) = verifier.groups().next().unwrap();
+            let mut scheduler = verifier.create_scheduler(group).unwrap();
+            if interrupt {
+                pause.interrupt();
+            }
+            let mut pauses = 0;
+            let result = loop {
+                let remaining = max_cycles
+                    .checked_sub(scheduler.consumed_cycles())
+                    .expect("a paused scheduler must stay within the total cap");
+                match scheduler.run(crate::RunMode::Pause(pause.clone(), remaining)) {
+                    Err(ckb_vm::Error::Pause) => pauses += 1,
+                    result => break result,
+                }
+            };
+            let messages = messages.lock().unwrap().clone();
+            (result, messages, pauses)
+        })
+    };
+
+    let (expected, expected_messages, pauses) = run(cycles, false);
+    let expected = expected.unwrap();
+    assert_eq!(expected.exit_code, 0);
+    assert_eq!(expected.consumed_cycles, cycles);
+    assert_eq!(pauses, 0);
+    for max_cycles in [u64::MAX, 0, cycles - 1, cycles] {
+        let (actual, messages, pauses) = run(max_cycles, true);
+        if max_cycles < cycles {
+            assert_eq!(actual.unwrap_err(), ckb_vm::Error::CyclesExceeded);
+        } else {
+            let actual = actual.unwrap();
+            assert_eq!(actual.exit_code, expected.exit_code);
+            assert_eq!(messages.len(), expected_messages.len());
+            for (index, (actual, expected)) in messages.iter().zip(&expected_messages).enumerate() {
+                assert_eq!(actual, expected, "guest trace differs at message {index}");
+            }
+            assert_eq!(actual.consumed_cycles, expected.consumed_cycles);
+        }
+        if max_cycles > 0 {
+            assert!(pauses > 1, "must interrupt running guest code repeatedly");
+        }
+    }
 }
