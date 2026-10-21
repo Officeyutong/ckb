@@ -92,8 +92,8 @@ impl VmRunner<'_> {
         }
     }
 
-    /// Own one execution slice through interruption and join. Its returned time
-    /// comes from the child thread, and its monitor cannot affect a resume.
+    /// A wall deadline requests a checkpoint, not a refusal. Only the joined
+    /// CPU receipt spends the budget; descheduled work resumes with what remains.
     async fn run_slice<F>(
         &mut self,
         mut execute: F,
@@ -108,33 +108,32 @@ impl VmRunner<'_> {
         let (started, start) = oneshot::channel();
         let child = VmTask {
             pause,
-            handle: tokio::spawn(async move {
-                let measured = if limit.is_some() {
-                    // Keep a runtime worker available to observe CPU progress
-                    // and controls while the VM runs synchronously.
-                    tokio::task::block_in_place(|| {
-                        let (clock, monitor) = CpuTime::start_monitored().map_err(clock_failure)?;
-                        let _ = started.send(monitor);
-                        let result = execute(child_pause);
-                        Ok((result, clock.elapsed()))
-                    })
+            handle: tokio::task::spawn_blocking(move || {
+                // The blocking executor keeps controls runnable and keeps both
+                // clock readings on the thread that actually executes the VM.
+                let clock = if let Some(limit) = limit {
+                    let clock = CpuTime::now().map_err(clock_failure)?;
+                    let deadline =
+                        tokio::time::Instant::now() + limit.max(Duration::from_millis(1));
+                    let _ = started.send(deadline);
+                    Some(clock)
                 } else {
-                    Ok((execute(child_pause), Ok(Duration::ZERO)))
+                    None
                 };
-                measured.map(|(result, elapsed)| (execute, result, elapsed))
+                let result = execute(child_pause);
+                let elapsed = clock.map_or(Ok(Duration::ZERO), |clock| clock.elapsed());
+                Ok((execute, result, elapsed))
             }),
         };
-        // Off-CPU waiting may postpone checks, but cannot itself request Pause.
-        // This future survives command changes and completes at most once.
-        let monitor = async move {
-            match (limit, start.await) {
-                (Some(limit), Ok(monitor)) => {
-                    wait_for_cpu_budget(limit, || monitor.observed()).await
-                }
+        // Start the deadline on the execution thread, excluding queueing. It
+        // survives command changes and can interrupt this slice only once.
+        let checkpoint = async move {
+            match start.await {
+                Ok(deadline) => tokio::time::sleep_until(deadline).await,
                 _ => std::future::pending().await,
             }
         };
-        child.join(self.command, desired, monitor).await?
+        child.join(self.command, desired, checkpoint).await?
     }
 }
 
@@ -154,23 +153,10 @@ fn unmeasured_result(
 
 fn clock_failure(error: io::Error) -> Error {
     ckb_logger::warn!("VM CPU measurement failed: {error}");
-    Error::External(VM_INTERRUPTED_MESSAGE.into())
-}
-
-/// Wait for observed CPU exhaustion, without repeatedly pausing off-CPU work.
-/// The 1 ms floor follows Tokio's timer granularity and bounds polling when a
-/// thread stops making progress just short of its limit.
-async fn wait_for_cpu_budget(
-    limit: Duration,
-    mut elapsed: impl FnMut() -> std::io::Result<Duration>,
-) -> std::io::Result<()> {
-    loop {
-        let remaining = limit.saturating_sub(elapsed()?);
-        if remaining.is_zero() {
-            return Ok(());
-        }
-        tokio::time::sleep(remaining.max(Duration::from_millis(1))).await;
+    if let Some(metrics) = ckb_metrics::handle() {
+        metrics.ckb_tx_pool_vm_cpu_clock_failures_total.inc();
     }
+    Error::External(VM_INTERRUPTED_MESSAGE.into())
 }
 
 /// Dropping the caller interrupts and cancels the slice it owns.
@@ -180,30 +166,21 @@ struct VmTask<T> {
 }
 
 impl<T> VmTask<T> {
-    /// Observe controls and the CPU monitor until this owned task has joined.
-    /// Desired commands survive the slice; late clock observations do not.
+    /// Observe controls and the checkpoint until this owned task has joined.
+    /// Desired commands survive the slice; its checkpoint does not.
     async fn join(
         mut self,
         command: &mut watch::Receiver<ChunkCommand>,
         desired: &mut ChunkCommand,
-        monitor: impl Future<Output = io::Result<()>>,
+        checkpoint: impl Future<Output = ()>,
     ) -> Result<T, Error> {
-        let monitor = monitor.fuse();
-        tokio::pin!(monitor);
+        let checkpoint = checkpoint.fuse();
+        tokio::pin!(checkpoint);
         let completed = loop {
             tokio::select! {
                 biased;
                 result = &mut self.handle => break result,
-                observed = &mut monitor => {
-                    if let Err(error) = observed {
-                        // Completion can occur after the first join poll. A
-                        // failed read of the old thread must not stop a resume.
-                        if let Some(result) = (&mut self.handle).now_or_never() {
-                            break result;
-                        }
-                        ckb_logger::warn!("VM CPU monitoring failed: {error}");
-                        *desired = ChunkCommand::Stop;
-                    }
+                () = &mut checkpoint => {
                     self.pause.interrupt();
                 }
                 changed = command.changed(), if *desired != ChunkCommand::Stop => {

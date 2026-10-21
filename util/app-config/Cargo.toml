@@ -35,8 +35,6 @@ url = { workspace = true, features = ["serde"] }
 ubyte = { workspace = true, features = ["serde"] }
 
 [features]
-# Configuration overrides for tests only.
-test = []
 with_sentry = ["sentry"]
 
 [dev-dependencies]

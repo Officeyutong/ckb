@@ -81,51 +81,11 @@ fn failed_measurement_cannot_accept_or_resume_but_preserves_vm_failures() {
     assert_eq!(result.consumed_cycles, 42);
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn completed_pause_wins_a_late_monitor_failure() {
-    let (_commands, mut receiver) = watch::channel(ChunkCommand::Resume);
-    let (release, released) = mpsc::channel();
-    let child = VmTask {
-        pause: Pause::new(),
-        handle: tokio::spawn(async move {
-            released.recv_timeout(TEST_TIMEOUT).unwrap();
-            (
-                Err::<TerminatedResult, _>(Error::Pause),
-                Duration::from_millis(1),
-            )
-        }),
-    };
-    let completed = child.handle.abort_handle();
-    let monitor = async move {
-        // This single poll runs after join first reported Pending. Complete the
-        // child on another worker before returning the old clock's read failure.
-        release.send(()).unwrap();
-        let watchdog = std::time::Instant::now();
-        while !completed.is_finished() {
-            assert!(watchdog.elapsed() < TEST_TIMEOUT, "child did not finish");
-            std::thread::yield_now();
-        }
-        Err(io::Error::other("the old execution thread exited"))
-    };
-    let mut desired = ChunkCommand::Resume;
-    let (result, receipt) = child
-        .join(&mut receiver, &mut desired, monitor)
-        .await
-        .unwrap();
-    assert_eq!(result.unwrap_err(), Error::Pause);
-    assert_eq!(receipt, Duration::from_millis(1));
-    assert_eq!(
-        desired,
-        ChunkCommand::Resume,
-        "the next slice must be allowed"
-    );
-}
-
 #[tokio::test]
-async fn running_monitor_failure_stops_and_joins_before_returning() {
+async fn checkpoint_interrupts_once_and_waits_for_the_receipt() {
     let (commands, mut receiver) = watch::channel(ChunkCommand::Resume);
     let (release, released) = oneshot::channel();
-    let pause = Pause::new();
+    let mut pause = Pause::new();
     let child = VmTask {
         pause: pause.clone(),
         handle: tokio::spawn(async move {
@@ -133,87 +93,19 @@ async fn running_monitor_failure_stops_and_joins_before_returning() {
             Err::<TerminatedResult, _>(Error::Pause)
         }),
     };
-    let monitor = async { Err(io::Error::other("clock unavailable")) };
     let mut desired = ChunkCommand::Resume;
-    let mut joined = Box::pin(child.join(&mut receiver, &mut desired, monitor));
+    let mut joined = Box::pin(child.join(&mut receiver, &mut desired, async {}));
     assert!(poll!(&mut joined).is_pending());
     assert!(pause.has_interrupted());
+    // The VM consumes its interrupt before returning. A completed checkpoint
+    // must stay inert while the owner still waits for the CPU receipt.
+    pause.free();
     commands.send(ChunkCommand::Resume).unwrap();
     assert!(poll!(&mut joined).is_pending());
+    assert!(!pause.has_interrupted());
     release.send(()).unwrap();
     assert_eq!(joined.await.unwrap().unwrap_err(), Error::Pause);
-    assert_eq!(desired, ChunkCommand::Stop);
-}
-
-#[tokio::test(start_paused = true)]
-async fn cpu_monitor_requires_progress_despite_repeated_wall_checks() {
-    use std::cell::Cell;
-
-    let limit = Duration::from_millis(100);
-    let cpu = Cell::new(Duration::ZERO);
-    let samples = Cell::new(0);
-    let wait = wait_for_cpu_budget(limit, || {
-        samples.set(samples.get() + 1);
-        Ok(cpu.get())
-    });
-    tokio::pin!(wait);
-    assert!(poll!(&mut wait).is_pending());
-    for count in 2..=4 {
-        tokio::time::advance(limit * 2).await;
-        assert!(poll!(&mut wait).is_pending());
-        assert_eq!(samples.get(), count);
-    }
-    cpu.set(limit);
-    tokio::time::advance(limit * 2).await;
-    assert!(matches!(poll!(&mut wait), std::task::Poll::Ready(Ok(()))));
-}
-
-#[tokio::test(start_paused = true)]
-async fn cpu_monitor_bounds_polling_near_an_exhausted_budget() {
-    use std::cell::Cell;
-
-    let limit = Duration::from_millis(100);
-    let cpu = Cell::new(limit - Duration::from_nanos(1));
-    let samples = Cell::new(0);
-    let wait = wait_for_cpu_budget(limit, || {
-        samples.set(samples.get() + 1);
-        Ok(cpu.get())
-    });
-    tokio::pin!(wait);
-    assert!(poll!(&mut wait).is_pending());
-    for step in 1..=20 {
-        tokio::time::advance(Duration::from_micros(100)).await;
-        assert!(poll!(&mut wait).is_pending());
-        assert!(samples.get() <= 1 + step / 10);
-    }
-    assert!(samples.get() > 1, "the monitor must still check progress");
-    cpu.set(limit);
-    tokio::time::advance(Duration::from_millis(2)).await;
-    assert!(matches!(poll!(&mut wait), std::task::Poll::Ready(Ok(()))));
-}
-
-#[tokio::test(start_paused = true)]
-async fn cpu_monitor_read_failure_is_distinct_from_exhaustion() {
-    for fail_on_first_read in [true, false] {
-        let limit = Duration::from_millis(100);
-        let mut fail = fail_on_first_read;
-        let wait = wait_for_cpu_budget(limit, || {
-            if fail {
-                Err(std::io::Error::other("clock unavailable"))
-            } else {
-                fail = true;
-                Ok(Duration::ZERO)
-            }
-        });
-        tokio::pin!(wait);
-        if !fail_on_first_read {
-            assert!(poll!(&mut wait).is_pending());
-            tokio::time::advance(limit * 2).await;
-        }
-        let error = wait.await.unwrap_err();
-        assert_eq!(error.kind(), std::io::ErrorKind::Other);
-        assert_eq!(error.to_string(), "clock unavailable");
-    }
+    assert_eq!(desired, ChunkCommand::Resume);
 }
 
 #[tokio::test]
@@ -297,54 +189,51 @@ async fn suspension_can_outlast_the_remaining_budget() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn off_cpu_wait_does_not_interrupt_or_exhaust_execution() {
-    for suspend_before_completion in [false, true] {
-        let (commands, mut receiver) = watch::channel(ChunkCommand::Resume);
-        let (execute, mut invocations, dropped) = controlled_vm();
-        let mut runner = VmRunner {
-            command: &mut receiver,
-            remaining: Some(Duration::from_millis(100)),
+async fn wall_checkpoints_resume_without_charging_off_cpu_time() {
+    let (_commands, mut receiver) = watch::channel(ChunkCommand::Resume);
+    let (execute, mut invocations, dropped) = controlled_vm();
+    let limit = Duration::from_millis(100);
+    let mut runner = VmRunner {
+        command: &mut receiver,
+        remaining: Some(limit),
+    };
+    let mut verification = Box::pin(runner.run_vm(execute));
+    for _ in 0..3 {
+        let running = tokio::select! {
+            result = &mut verification => panic!("off-CPU time exhausted the budget: {result:?}"),
+            invocation = invocations.recv() => invocation.unwrap(),
         };
-        let mut verification = Box::pin(runner.run_vm(execute));
-        assert!(poll!(&mut verification).is_pending());
-        let running = invocations.recv().await.unwrap();
-        // The channel holds the child off CPU. Poll the parent after each
-        // budget-length wall interval: it must not interrupt this execution.
-        let mut interrupted_while_waiting = false;
-        for _ in 0..3 {
-            tokio::select! {
-                result = &mut verification => panic!("the child has not returned: {result:?}"),
-                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+        // The execution thread is blocked on a channel, with no CPU work.
+        // Observe the actual checkpoint interrupt before acknowledging Pause.
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut verification => panic!("the slice has not returned: {result:?}"),
+                    _ = tokio::task::yield_now() => {
+                        if running.pause.has_interrupted() {
+                            break;
+                        }
+                    }
+                }
             }
-            assert!(poll!(&mut verification).is_pending());
-            interrupted_while_waiting |= running.pause.has_interrupted();
-            assert!(invocations.try_recv().is_err());
-        }
-        if suspend_before_completion {
-            commands.send(ChunkCommand::Suspend).unwrap();
-            assert!(poll!(&mut verification).is_pending());
-            assert!(running.pause.has_interrupted());
-            commands.send(ChunkCommand::Resume).unwrap();
-            assert!(poll!(&mut verification).is_pending());
-            running.finish.send(Err(Error::Pause)).unwrap();
-            let resumed = tokio::select! {
-                result = &mut verification => panic!("off-CPU time exhausted the budget: {result:?}"),
-                invocation = invocations.recv() => invocation.unwrap(),
-            };
-            assert!(!resumed.pause.has_interrupted());
-            resumed.finish.send(Ok(success())).unwrap();
-        } else {
-            running.finish.send(Ok(success())).unwrap();
-        }
-        let result = verification.await;
+        })
+        .await
+        .unwrap();
         assert!(
-            !interrupted_while_waiting,
-            "wall time alone must not interrupt the scheduler"
+            invocations.try_recv().is_err(),
+            "resume must wait for the receipt"
         );
-        assert_eq!(result.unwrap().unwrap().consumed_cycles, 42);
-        assert!(!runner.remaining.unwrap().is_zero());
-        dropped.await.unwrap();
+        running.finish.send(Err(Error::Pause)).unwrap();
     }
+    let resumed = tokio::select! {
+        result = &mut verification => panic!("wall checkpoints spent the CPU budget: {result:?}"),
+        invocation = invocations.recv() => invocation.unwrap(),
+    };
+    resumed.finish.send(Ok(success())).unwrap();
+    assert_eq!(verification.await.unwrap().unwrap().consumed_cycles, 42);
+    assert!(!runner.remaining.unwrap().is_zero());
+    dropped.await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -469,7 +358,7 @@ async fn cpu_limit_survives_resume_flood_and_joins_vm_on_a_single_worker() {
     let _ = stop_watchdog.send(());
     assert!(
         watchdog.join().unwrap(),
-        "the runtime failed to poll its CPU monitor"
+        "the runtime failed to poll its checkpoint"
     );
     assert!(result.unwrap().is_none());
     assert!(
@@ -554,37 +443,6 @@ async fn resumed_slices_spend_one_cpu_budget() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn consuming_the_cpu_interrupt_does_not_rearm_the_monitor() {
-    let (_commands, mut receiver) = watch::channel(ChunkCommand::Resume);
-    let (mut execute, mut invocations, dropped) = controlled_vm();
-    let execute = move |pause: Pause| {
-        while !pause.has_interrupted() {
-            std::hint::spin_loop();
-        }
-        execute(pause)
-    };
-    let mut runner = VmRunner {
-        command: &mut receiver,
-        remaining: Some(Duration::from_millis(10)),
-    };
-    let mut verification = Box::pin(runner.run_vm(execute));
-    assert!(poll!(&mut verification).is_pending());
-    let mut running = tokio::select! {
-        result = &mut verification => panic!("the slice has not returned: {result:?}"),
-        invocation = invocations.recv() => invocation.unwrap(),
-    };
-    assert!(running.pause.has_interrupted());
-    // CKB-VM clears the interrupt when it observes Pause, before the scheduler
-    // returns. A completed monitor must remain inert during that interval.
-    running.pause.free();
-    assert!(poll!(&mut verification).is_pending());
-    assert!(!running.pause.has_interrupted());
-    running.finish.send(Err(Error::Pause)).unwrap();
-    assert!(verification.await.unwrap().is_none());
-    dropped.await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn joined_receipt_excludes_delay_after_task_completion() {
     let (_commands, mut receiver) = watch::channel(ChunkCommand::Resume);
     let child = VmTask {
@@ -604,14 +462,12 @@ async fn joined_receipt_excludes_delay_after_task_completion() {
     .await
     .unwrap();
     // Completion has been published. Delay joining by more than the budget;
-    // even a failing monitor must not replace the already final CPU receipt.
+    // a ready checkpoint must not replace the already final CPU receipt.
     let limit = Duration::from_millis(250);
     tokio::time::sleep(limit + Duration::from_millis(100)).await;
     let mut desired = ChunkCommand::Resume;
     let elapsed = child
-        .join(&mut receiver, &mut desired, async {
-            Err(io::Error::other("old thread unavailable"))
-        })
+        .join(&mut receiver, &mut desired, async {})
         .await
         .unwrap();
     assert!(elapsed >= Duration::from_millis(2));
@@ -620,15 +476,16 @@ async fn joined_receipt_excludes_delay_after_task_completion() {
 }
 
 #[test]
-fn waiting_for_a_runtime_worker_does_not_spend_vm_time() {
+fn waiting_for_a_blocking_worker_does_not_spend_vm_time() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
+        .max_blocking_threads(1)
         .enable_all()
         .build()
         .unwrap();
     let (occupied, worker_occupied) = mpsc::channel();
     let (release, released) = mpsc::channel();
-    let blocker = runtime.spawn(async move {
+    let blocker = runtime.spawn_blocking(move || {
         occupied.send(()).unwrap();
         released.recv_timeout(TEST_TIMEOUT).unwrap();
     });
@@ -641,7 +498,7 @@ fn waiting_for_a_runtime_worker_does_not_spend_vm_time() {
         };
         let mut verification = Box::pin(runner.run_vm(|_| Ok(success())));
         assert!(poll!(&mut verification).is_pending());
-        // Keep the only worker occupied past the budget before releasing it.
+        // Keep the only blocking worker occupied past the budget before releasing it.
         std::thread::sleep(Duration::from_millis(350));
         release.send(()).unwrap();
         blocker.await.unwrap();
@@ -714,6 +571,102 @@ async fn scheduler_state_and_cycles_survive_joined_pauses() {
             .unwrap();
         assert_eq!(actual.exit_code, expected.exit_code);
         assert_eq!(actual.consumed_cycles, expected.consumed_cycles);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn spawned_vm_controls_preserve_guest_trace_and_canonical_errors() {
+    use super::super::tests::{program_transaction, snapshot};
+    use ckb_chain_spec::consensus::ConsensusBuilder;
+    use ckb_script::{ScriptError, ScriptVersion, TransactionScriptsVerifier};
+    use ckb_store::data_loader_wrapper::AsDataLoader;
+    use ckb_types::core::hardfork::HardForks;
+    use ckb_verification::TxVerifyEnv;
+    use std::sync::{Arc, Mutex};
+
+    let snapshot = snapshot(Arc::new(
+        ConsensusBuilder::default()
+            .hardfork_switch(HardForks::new_dev())
+            .build(),
+    ));
+    let rtx = program_transaction(
+        ScriptVersion::V2,
+        &[include_bytes!(
+            "../../../../script/testdata/spawn_create_17_spawn"
+        )],
+    );
+    let env = Arc::new(TxVerifyEnv::new_submit(snapshot.tip_header()));
+    let verifier = |printer: DebugPrinter| {
+        TransactionScriptsVerifier::new_with_debug_printer(
+            Arc::clone(&rtx),
+            snapshot.as_data_loader(),
+            snapshot.cloned_consensus(),
+            Arc::clone(&env),
+            printer,
+        )
+    };
+    let cycles = verifier(Arc::new(|_, _| {})).verify(u64::MAX).unwrap();
+    for (cap, stop) in [(cycles, false), (cycles - 1, false), (u64::MAX, true)] {
+        let expected_trace = Arc::new(Mutex::new(Vec::new()));
+        let output = Arc::clone(&expected_trace);
+        let expected = verifier(Arc::new(move |_, message| {
+            output.lock().unwrap().push(message.to_owned());
+        }))
+        .verify(cap);
+        let (events, mut messages) = async_mpsc::unbounded_channel();
+        let controlled = verifier(Arc::new(move |_, message| {
+            let (release, released) = mpsc::channel();
+            events.send((message.to_owned(), release)).unwrap();
+            // Hold a real guest syscall until the controller observes Suspend.
+            released.recv_timeout(TEST_TIMEOUT).unwrap();
+        }));
+        let (commands, mut receiver) = watch::channel(ChunkCommand::Resume);
+        let mut runner = VmRunner {
+            command: &mut receiver,
+            remaining: Some(TEST_TIMEOUT),
+        };
+        let mut execution = Box::pin(controlled.verify_with_runner(cap, &mut runner));
+        let mut actual_trace = Vec::new();
+        let actual = tokio::time::timeout(TEST_TIMEOUT, async {
+            loop {
+                let (message, release) = tokio::select! {
+                    biased;
+                    result = &mut execution => break result,
+                    message = messages.recv() => message.unwrap(),
+                };
+                actual_trace.push(message);
+                commands.send(ChunkCommand::Suspend).unwrap();
+                assert!(poll!(&mut execution).is_pending());
+                // The controller has polled Suspend while the syscall is held.
+                // Resume/Stop must not clear that slice's pending interrupt.
+                commands
+                    .send(if stop {
+                        ChunkCommand::Stop
+                    } else {
+                        ChunkCommand::Resume
+                    })
+                    .unwrap();
+                assert!(poll!(&mut execution).is_pending());
+                release.send(()).unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        if stop {
+            let expected: ckb_error::Error = ScriptError::Interrupts.input_lock_script(0).into();
+            ckb_error::assert_error_eq!(actual.unwrap_err(), expected);
+            assert_eq!(actual_trace.len(), 1, "Stop must not resume the guest");
+        } else {
+            match expected {
+                Ok(cycles) => assert_eq!(actual.unwrap(), Some(cycles)),
+                Err(error) => ckb_error::assert_error_eq!(actual.unwrap_err(), error),
+            }
+            assert!(
+                actual_trace.len() > 1,
+                "must interrupt spawned work repeatedly"
+            );
+            assert_eq!(actual_trace, *expected_trace.lock().unwrap());
+        }
     }
 }
 

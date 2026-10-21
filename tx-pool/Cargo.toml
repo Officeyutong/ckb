@@ -54,17 +54,17 @@ libc.workspace = true
 nix = { version = "0.31.2", default-features = false, features = ["time"] }
 
 [target.'cfg(windows)'.dependencies]
-winapi = { version = "0.3", features = ["handleapi", "processthreadsapi", "winnt"] }
+winapi = { version = "0.3", features = ["processthreadsapi"] }
 
 [dev-dependencies]
-ckb-app-config = { workspace = true, features = ["test"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
 ckb-hash.workspace = true
 ckb-systemtime = { workspace = true, features = ["enable_faketime"] }
 
 [features]
 default = []
+# Explicitly enabled by the integration-test node binary.
+test = []
 internal = []
 with_sentry = ["sentry"]
 portable = ["ckb-db/portable", "ckb-store/portable", "ckb-snapshot/portable"]

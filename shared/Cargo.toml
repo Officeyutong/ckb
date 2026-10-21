@@ -43,6 +43,7 @@ dashmap.workspace = true
 ckb-systemtime = { workspace = true, features = ["enable_faketime"] }
 
 [features]
+test = ["ckb-tx-pool/test"]
 portable = [
     "ckb-db/portable",
     "ckb-store/portable",

@@ -23,9 +23,10 @@ const DIRECT_ORPHAN_CYCLES: u64 = 1_000_000_000;
 pub struct NetworkVerificationTimeBudget;
 
 impl Spec for NetworkVerificationTimeBudget {
+    crate::setup!(env: vec![("CKB_TEST_MAX_TX_VERIFY_TIME_MS", "1")]);
+
     fn modify_app_config(&self, config: &mut ckb_app_config::CKBAppConfig) {
         config.network.connect_outbound_interval_secs = 0;
-        config.tx_pool.max_tx_verify_time_ms = std::num::NonZeroU32::MIN;
         config.tx_pool.max_tx_verify_cycles = DIRECT_ORPHAN_CYCLES;
     }
 

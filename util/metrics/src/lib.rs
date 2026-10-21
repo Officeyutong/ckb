@@ -104,6 +104,16 @@ pub struct Metrics {
     pub ckb_tx_pool_sync_process: Histogram,
     /// Histogram for async process tx in txpool
     pub ckb_tx_pool_async_process: Histogram,
+    /// Current network VM budget mode: calibrated, cap_only or unavailable.
+    pub ckb_tx_pool_vm_calibration: IntGaugeVec,
+    /// Wall time spent initializing the process-wide VM calibration.
+    pub ckb_tx_pool_vm_calibration_seconds: Gauge,
+    /// Calibrated consensus cycles per millisecond, including policy slack.
+    pub ckb_tx_pool_vm_cycles_per_ms: Gauge,
+    /// Network transactions refused after exhausting their local CPU budget.
+    pub ckb_tx_pool_vm_cpu_budget_refusals_total: IntCounter,
+    /// Failed execution-thread CPU readings after the budget was enabled.
+    pub ckb_tx_pool_vm_cpu_clock_failures_total: IntCounter,
     /// Counter for relay compact block transaction count
     pub ckb_relay_cb_transaction_count: IntCounter,
     /// Counter for relay compact block reconstruct ok
@@ -252,6 +262,27 @@ static METRICS: std::sync::LazyLock<Metrics> = std::sync::LazyLock::new(|| {
         "The CKB tx_pool async process tx duration"
     )
     .unwrap(),
+    ckb_tx_pool_vm_calibration: register_int_gauge_vec!(
+        "ckb_tx_pool_vm_calibration",
+        "The active network VM CPU budget mode",
+        &["mode"]
+    ).unwrap(),
+    ckb_tx_pool_vm_calibration_seconds: register_gauge!(
+        "ckb_tx_pool_vm_calibration_seconds",
+        "Wall time spent initializing VM CPU calibration"
+    ).unwrap(),
+    ckb_tx_pool_vm_cycles_per_ms: register_gauge!(
+        "ckb_tx_pool_vm_cycles_per_ms",
+        "Calibrated VM cycles per millisecond including policy slack"
+    ).unwrap(),
+    ckb_tx_pool_vm_cpu_budget_refusals_total: register_int_counter!(
+        "ckb_tx_pool_vm_cpu_budget_refusals_total",
+        "Network transactions refused by their local VM CPU budget"
+    ).unwrap(),
+    ckb_tx_pool_vm_cpu_clock_failures_total: register_int_counter!(
+        "ckb_tx_pool_vm_cpu_clock_failures_total",
+        "Execution-thread CPU clock failures"
+    ).unwrap(),
     ckb_relay_cb_transaction_count: register_int_counter!(
         "ckb_relay_cb_transaction_count",
         "The CKB relay compact block transaction count"

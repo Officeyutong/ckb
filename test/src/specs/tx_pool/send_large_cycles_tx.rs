@@ -32,7 +32,8 @@ impl SendLargeCyclesTxInBlock {
 }
 
 impl Spec for SendLargeCyclesTxInBlock {
-    crate::setup!(num_nodes: 2);
+    // The network budget must not affect local RPC or canonical block verification.
+    crate::setup!(num_nodes: 2, env: vec![("CKB_TEST_MAX_TX_VERIFY_TIME_MS", "1")]);
 
     fn run(&self, nodes: &mut Vec<Node>) {
         let node0 = &nodes[0];
@@ -75,8 +76,6 @@ impl Spec for SendLargeCyclesTxInBlock {
         let lock_arg = self.random_key.lock_arg();
         config.network.connect_outbound_interval_secs = 0;
         config.tx_pool.max_tx_verify_cycles = 5000u64;
-        // The network budget must not affect local RPC or canonical block verification.
-        config.tx_pool.max_tx_verify_time_ms = std::num::NonZeroU32::MIN;
         let block_assembler = new_block_assembler_config(lock_arg, ScriptHashType::Type);
         config.block_assembler = Some(block_assembler);
     }

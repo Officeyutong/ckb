@@ -334,6 +334,65 @@ async fn budgeted_verification_preserves_vm_versions_cycles_and_errors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn calibrated_budget_admits_representative_vm_workloads() {
+    let snapshot = snapshot(Arc::new(
+        ConsensusBuilder::default()
+            .hardfork_switch(HardForks::new_dev())
+            .build(),
+    ));
+    let env = Arc::new(TxVerifyEnv::new_submit(snapshot.tip_header()));
+    let started = std::time::Instant::now();
+    calibration::initialize();
+    println!("calibration startup: {:?}", started.elapsed());
+    for (name, version, program) in [
+        (
+            "simple",
+            ScriptVersion::V0,
+            include_bytes!("../../../script/testdata/always_success").as_slice(),
+        ),
+        (
+            "debug",
+            ScriptVersion::V1,
+            include_bytes!("../../../script/testdata/debugger").as_slice(),
+        ),
+        (
+            "syscalls",
+            ScriptVersion::V1,
+            include_bytes!("../../../script/testdata/current_cycles").as_slice(),
+        ),
+        (
+            "spawn and IO",
+            ScriptVersion::V2,
+            include_bytes!("../../../script/testdata/spawn_create_17_spawn").as_slice(),
+        ),
+    ] {
+        let verifier = TransactionScriptsVerifier::new(
+            program_transaction(version, &[program]),
+            snapshot.as_data_loader(),
+            snapshot.cloned_consensus(),
+            Arc::clone(&env),
+        );
+        let cycles = verifier.verify(u64::MAX).unwrap();
+        let limit = calibration::time_limit(Some(cycles)).unwrap();
+        let (_commands, mut commands) = watch::channel(ChunkCommand::Resume);
+        let mut runner = execution::VmRunner {
+            command: &mut commands,
+            remaining: Some(limit),
+        };
+        assert_eq!(
+            verifier
+                .verify_with_runner(cycles, &mut runner)
+                .await
+                .unwrap(),
+            Some(cycles),
+            "{name}"
+        );
+        let elapsed = limit - runner.remaining.unwrap();
+        println!("{name}: {cycles} cycles, {elapsed:?} CPU, {limit:?} allowance");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn real_spawned_vm_cannot_outlive_its_budget() {
     let snapshot = snapshot(Arc::new(
         ConsensusBuilder::default()

@@ -356,7 +356,6 @@ fn tx_pool_config() -> TxPoolConfig {
         min_fee_rate: FeeRate::zero(),
         min_rbf_rate: FeeRate::zero(),
         max_tx_verify_cycles: MAX_TX_VERIFY_CYCLES,
-        max_tx_verify_time_ms: std::num::NonZeroU32::new(8_000).unwrap(),
         max_tx_verify_workers: 1,
         max_ancestors_count: 125,
         keep_rejected_tx_hashes_days: 1,

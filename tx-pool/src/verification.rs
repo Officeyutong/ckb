@@ -7,7 +7,7 @@ mod execution;
 #[cfg(test)]
 mod tests;
 
-use crate::{error::Reject, service::TxPoolService};
+use crate::error::Reject;
 use ckb_script::ChunkCommand;
 use ckb_snapshot::Snapshot;
 use ckb_store::ChainStore;
@@ -19,13 +19,6 @@ use ckb_verification::{
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::watch, task::block_in_place};
-
-impl TxPoolService {
-    pub(crate) fn verification_time_limit(&self, declared_cycles: Option<Cycle>) -> Duration {
-        let cap = self.tx_pool_config.max_tx_verify_time();
-        declared_cycles.map_or(cap, |cycles| calibration::for_cycles(cycles, cap))
-    }
-}
 
 pub(crate) async fn verify_rtx(
     snapshot: Arc<Snapshot>,
@@ -82,7 +75,12 @@ pub(crate) async fn verify_rtx(
                 )
                 .await
                 .map_err(Reject::Verification)?
-                .ok_or(Reject::ExcessiveVerifyTime)
+                .ok_or_else(|| {
+                    if let Some(metrics) = ckb_metrics::handle() {
+                        metrics.ckb_tx_pool_vm_cpu_budget_refusals_total.inc();
+                    }
+                    Reject::ExcessiveVerifyTime
+                })
         }
     }
 }

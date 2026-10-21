@@ -9,7 +9,11 @@ use ckb_vm::{
     elf::{LoadingAction, ProgramMetadata},
     memory::{FLAG_EXECUTABLE, FLAG_FREEZED},
 };
-use std::{num::NonZeroU128, sync::LazyLock, time::Duration};
+use std::{
+    num::NonZeroU128,
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 
 const SAMPLE_CYCLES: u64 = 5_000_000;
 
@@ -105,26 +109,81 @@ impl Measurement {
     }
 }
 
-static VM_TIMING: LazyLock<Option<VmTiming>> = LazyLock::new(|| {
-    let sample = match Measurement::measure() {
-        Ok(sample) => sample,
-        Err(error) => {
-            ckb_logger::warn!("VM calibration failed; using the network time cap: {error}");
-            return None;
+/// CPU measurement availability and calibration are different capabilities.
+/// A usable clock still enforces the cap if the sample cannot define a rate.
+/// Without a clock, keep the existing cycle-bounded verification path.
+enum Calibration {
+    Measured(VmTiming),
+    CapOnly,
+    Unavailable,
+}
+
+impl Calibration {
+    fn measure() -> Self {
+        if let Err(error) = CpuTime::now() {
+            ckb_logger::warn!(
+                "Network VM CPU budget disabled; thread CPU clock unavailable: {error}"
+            );
+            return Self::Unavailable;
         }
+        match Measurement::measure() {
+            Ok(sample) => match VmTiming::from_sample(sample) {
+                Some(timing) => Self::Measured(timing),
+                None => {
+                    ckb_logger::warn!(
+                        "VM calibration clock resolution is insufficient; using the network CPU cap"
+                    );
+                    Self::CapOnly
+                }
+            },
+            Err(error) => {
+                ckb_logger::warn!("VM calibration failed; using the network CPU cap: {error}");
+                Self::CapOnly
+            }
+        }
+    }
+
+    fn limit(&self, cycles: Option<u64>, cap: Duration) -> Option<Duration> {
+        match self {
+            Self::Measured(timing) => Some(cycles.map_or(cap, |cycles| timing.limit(cycles, cap))),
+            Self::CapOnly => Some(cap),
+            Self::Unavailable => None,
+        }
+    }
+}
+
+static VM_TIMING: LazyLock<Calibration> = LazyLock::new(|| {
+    let started = Instant::now();
+    let calibration = Calibration::measure();
+    let mode = match &calibration {
+        Calibration::Measured(timing) => {
+            ckb_logger::info!(
+                "Network VM CPU calibration: {} cycles/ms, minimum {} ms",
+                timing.cycles_per_ms,
+                timing.minimum.as_millis(),
+            );
+            "calibrated"
+        }
+        Calibration::CapOnly => "cap_only",
+        Calibration::Unavailable => "unavailable",
     };
-    let Some(timing) = VmTiming::from_sample(sample) else {
-        ckb_logger::warn!(
-            "VM calibration clock resolution is insufficient; using the network time cap"
-        );
-        return None;
-    };
-    ckb_logger::info!(
-        "Network VM CPU calibration: {} cycles/ms, minimum {} ms",
-        timing.cycles_per_ms,
-        timing.minimum.as_millis(),
-    );
-    Some(timing)
+    let elapsed = started.elapsed();
+    ckb_logger::info!("Network VM CPU calibration mode {mode}, startup cost {elapsed:?}");
+    if let Some(metrics) = ckb_metrics::handle() {
+        metrics
+            .ckb_tx_pool_vm_calibration
+            .with_label_values(&[mode])
+            .set(1);
+        metrics
+            .ckb_tx_pool_vm_calibration_seconds
+            .set(elapsed.as_secs_f64());
+        if let Calibration::Measured(timing) = &calibration {
+            metrics
+                .ckb_tx_pool_vm_cycles_per_ms
+                .set(timing.cycles_per_ms as f64);
+        }
+    }
+    calibration
 });
 
 /// Calibrate before the pool accepts work; reuse the process-wide result.
@@ -132,10 +191,27 @@ pub(crate) fn initialize() {
     LazyLock::force(&VM_TIMING);
 }
 
-pub(crate) fn for_cycles(cycles: u64, cap: Duration) -> Duration {
-    VM_TIMING
-        .as_ref()
-        .map_or(cap, |timing| timing.limit(cycles, cap))
+/// Network admission policy, shared by relay, proposal and orphan verification.
+/// This cap and the calibration slack are internal policy, not node configuration.
+pub(crate) fn time_limit(declared_cycles: Option<u64>) -> Option<Duration> {
+    let cap = Duration::from_secs(ckb_chain_spec::consensus::MIN_BLOCK_INTERVAL);
+    #[cfg(feature = "test")]
+    let cap = {
+        // Only an explicitly built test node reads this process-local override.
+        // The integration harness never enables this feature on its dependencies.
+        static OVERRIDE: LazyLock<Option<Duration>> = LazyLock::new(|| {
+            let value = std::env::var("CKB_TEST_MAX_TX_VERIFY_TIME_MS").ok()?;
+            match value.parse::<std::num::NonZeroU32>() {
+                Ok(millis) => Some(Duration::from_millis(u64::from(millis.get()))),
+                Err(error) => {
+                    ckb_logger::warn!("Invalid test VM CPU cap {value:?}: {error}");
+                    None
+                }
+            }
+        });
+        OVERRIDE.unwrap_or(cap)
+    };
+    VM_TIMING.limit(declared_cycles, cap)
 }
 
 struct VmTiming {
@@ -224,6 +300,25 @@ mod tests {
         assert_eq!(
             fast.limit(0, Duration::from_millis(1)),
             Duration::from_millis(1)
+        );
+    }
+
+    #[test]
+    fn clock_availability_and_calibration_failure_have_distinct_fallbacks() {
+        let cap = Duration::from_secs(8);
+        let measured = Calibration::Measured(VmTiming {
+            cycles_per_ms: 1_000,
+            minimum: Duration::from_millis(10),
+        });
+        for cycles in [None, Some(0), Some(10_001), Some(u64::MAX)] {
+            assert_eq!(Calibration::Unavailable.limit(cycles, cap), None);
+            assert_eq!(Calibration::CapOnly.limit(cycles, cap), Some(cap));
+            assert!(measured.limit(cycles, cap).unwrap() <= cap);
+        }
+        assert_eq!(measured.limit(None, cap), Some(cap));
+        assert_eq!(
+            measured.limit(Some(10_001), cap),
+            Some(Duration::from_millis(11))
         );
     }
 

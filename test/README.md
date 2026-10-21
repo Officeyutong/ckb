@@ -3,7 +3,7 @@ This directory contains integration tests that test CKB binary. It does not cont
 ## Running tests locally
 
 Build the test node from the repository root with `cargo build --locked --bin ckb --release --features test,deadlock_detection`.
-The `test` feature enables internal overrides such as the network verification time cap; production builds omit these configuration fields.
+The `test` feature enables the `CKB_TEST_MAX_TX_VERIFY_TIME_MS` environment override for network verification. Specs pass it only to their child node processes through `Setup::env`. Production builds ignore it, and node configuration files never accept a time-cap override.
 
 The following command assumes that CKB binary is built as `../target/release/ckb` and starting node on port 9000:
 

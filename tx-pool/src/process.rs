@@ -10,7 +10,7 @@ use crate::util::{
     check_duplicate_proposal_id, check_tx_fee, is_missing_input, non_contextual_verify,
     time_relative_verify,
 };
-use crate::verification::verify_rtx;
+use crate::verification::{calibration, verify_rtx};
 use ckb_error::{AnyError, InternalErrorKind};
 use ckb_fee_estimator::FeeEstimator;
 use ckb_jsonrpc_types::BlockTemplate;
@@ -421,7 +421,7 @@ impl TxPoolService {
                 tx.clone(),
                 remote.map(|r| r.0),
                 None,
-                remote.map(|r| self.verification_time_limit(Some(r.0))),
+                remote.and_then(|r| calibration::time_limit(Some(r.0))),
             )
             .await
         {
@@ -642,7 +642,7 @@ impl TxPoolService {
                         orphan.tx.clone(),
                         Some(orphan.cycle),
                         None,
-                        Some(self.verification_time_limit(Some(orphan.cycle))),
+                        calibration::time_limit(Some(orphan.cycle)),
                     )
                     .await
                 {

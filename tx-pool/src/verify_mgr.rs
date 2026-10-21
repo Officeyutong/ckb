@@ -150,10 +150,11 @@ impl Worker {
                     entry.tx.clone(),
                     entry.remote.map(|e| e.0),
                     Some(&mut self.command_rx),
-                    (entry.is_proposal || entry.remote.is_some()).then(|| {
-                        self.service
-                            .verification_time_limit(entry.remote.map(|r| r.0))
-                    }),
+                    if entry.is_proposal || entry.remote.is_some() {
+                        crate::verification::calibration::time_limit(entry.remote.map(|r| r.0))
+                    } else {
+                        None
+                    },
                 )
                 .await
             {

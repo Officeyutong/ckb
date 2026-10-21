@@ -705,6 +705,10 @@ impl Node {
     }
 
     pub fn start(&mut self) {
+        self.start_with_env(&[]);
+    }
+
+    pub fn start_with_env(&mut self, env: &[(&str, &str)]) {
         let working_dir = self.working_dir();
         let args = ["-C", &working_dir.to_string_lossy(), "run", "--ba-advanced"];
         let binary = binary();
@@ -717,6 +721,7 @@ impl Node {
 
         let mut child_process = Command::new(binary)
             .env("RUST_BACKTRACE", "full")
+            .envs(env.iter().copied())
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
