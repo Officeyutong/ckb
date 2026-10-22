@@ -106,7 +106,7 @@ fn refetch_tx_asks_fallback_peers() {
     std::thread::sleep(std::time::Duration::from_millis(1));
     assert_eq!(
         state.pop_ask_for_txs().get(&announcer),
-        Some(&vec![tx_hash.clone()])
+        Some(&vec![tx_hash])
     );
 }
 
