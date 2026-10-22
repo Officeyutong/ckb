@@ -36,6 +36,7 @@ impl<'a> TransactionsProcess<'a> {
 
     pub fn execute(self) -> Status {
         let shared_state = self.relayer.shared().state();
+        let mut fallback_peers = Vec::new();
         let txs: Vec<(TransactionView, Cycle)> = {
             // ignore the tx if it's already known or it has never been requested before
             let mut tx_filter = shared_state.tx_filter();
@@ -47,11 +48,16 @@ impl<'a> TransactionsProcess<'a> {
                 .iter()
                 .map(|tx| (tx.transaction().to_entity().into_view(), tx.cycles().into()))
                 .filter(|(tx, _)| {
-                    !tx_filter.contains(&tx.hash())
-                        && unknown_tx_hashes
-                            .get_priority(&tx.hash())
-                            .map(|priority| priority.requesting_peer() == Some(self.peer))
-                            .unwrap_or_default()
+                    if tx_filter.contains(&tx.hash()) {
+                        return false;
+                    }
+                    match unknown_tx_hashes.get_priority(&tx.hash()) {
+                        Some(priority) if priority.requesting_peer() == Some(self.peer) => {
+                            fallback_peers.push((tx.hash(), priority.fallback_peers()));
+                            true
+                        }
+                        _ => false,
+                    }
                 })
                 .collect()
         };
@@ -74,6 +80,9 @@ impl<'a> TransactionsProcess<'a> {
         }
 
         shared_state.mark_as_known_txs(txs.iter().map(|(tx, _)| tx.hash()));
+        for (tx_hash, peers) in fallback_peers {
+            shared_state.add_tx_fallback_peers(tx_hash, peers);
+        }
 
         let tx_pool = self.relayer.shared.shared().tx_pool_controller().clone();
         let peer = self.peer;

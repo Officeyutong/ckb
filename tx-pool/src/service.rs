@@ -786,6 +786,13 @@ pub enum TxVerificationResult {
         /// transaction hash
         tx_hash: Byte32,
     },
+    /// tx body from a remote peer was discarded because that peer sent a malformed tx and was banned.
+    /// The relay identity `tx.hash()` excludes witnesses, so a valid variant may still exist and
+    /// should be fetched again from other peers which announced it.
+    Refetch {
+        /// transaction hash
+        tx_hash: Byte32,
+    },
 }
 
 #[allow(clippy::cognitive_complexity)]

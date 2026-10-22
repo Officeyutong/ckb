@@ -532,6 +532,7 @@ fn all_specs() -> Vec<Box<dyn Spec>> {
         // Box::new(TransactionRelayMultiple),
         Box::new(RelayInvalidTransaction),
         Box::new(RelayInvalidTransactionResumable),
+        Box::new(RelayInvalidWitnessVariant::default()),
         Box::new(TransactionRelayTimeout),
         Box::new(TransactionRelayEmptyPeers),
         Box::new(TransactionRelayConflict),

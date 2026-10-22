@@ -329,7 +329,7 @@ impl TxPoolService {
             if reject.is_malformed_tx()
                 && let Some(remote) = remote
             {
-                self.ban_malformed(remote.1, format!("reject {reject}"))
+                self.ban_malformed(remote.1, tx.hash(), format!("reject {reject}"))
                     .await;
             }
             return Err(reject);
@@ -516,7 +516,8 @@ impl TxPoolService {
                         self.add_orphan(tx, peer, declared_cycle).await;
                     } else {
                         if reject.is_malformed_tx() {
-                            self.ban_malformed(peer, format!("reject {reject}")).await;
+                            self.ban_malformed(peer, tx_hash.clone(), format!("reject {reject}"))
+                                .await;
                         }
                         if reject.is_allowed_relay() {
                             self.send_result_to_relayer(TxVerificationResult::Reject {
@@ -656,8 +657,12 @@ impl TxPoolService {
                             if !is_missing_input(&reject) {
                                 self.remove_orphan_tx_by_hash(&orphan_hash).await;
                                 if reject.is_malformed_tx() {
-                                    self.ban_malformed(orphan.peer, format!("reject {reject}"))
-                                        .await;
+                                    self.ban_malformed(
+                                        orphan.peer,
+                                        orphan.tx.hash(),
+                                        format!("reject {reject}"),
+                                    )
+                                    .await;
                                 }
                                 if reject.is_allowed_relay() {
                                     self.send_result_to_relayer(TxVerificationResult::Reject {
@@ -681,7 +686,12 @@ impl TxPoolService {
         }
     }
 
-    async fn ban_malformed(&self, peer: PeerIndex, reason: String) {
+    /// Ban the peer which sent the malformed tx `tx_hash`, and drop its other queued txs.
+    ///
+    /// The relayer marks a tx hash as known when the body is received, and `tx.hash()` excludes
+    /// witnesses, so the relayer is asked to refetch every discarded tx from other peers. Otherwise
+    /// a malicious responder could suppress the relay of a valid witness variant.
+    async fn ban_malformed(&self, peer: PeerIndex, tx_hash: Byte32, reason: String) {
         const DEFAULT_BAN_TIME: Duration = Duration::from_secs(3600 * 24 * 3);
 
         #[cfg(feature = "with_sentry")]
@@ -704,7 +714,10 @@ impl TxPoolService {
             },
         );
         self.network.ban_peer(peer, DEFAULT_BAN_TIME, reason);
-        self.verify_queue.write().await.remove_txs_by_peer(&peer);
+        let discarded = self.verify_queue.write().await.remove_txs_by_peer(&peer);
+        for tx_hash in std::iter::once(tx_hash).chain(discarded) {
+            self.send_result_to_relayer(TxVerificationResult::Refetch { tx_hash });
+        }
     }
 
     pub(crate) async fn _process_tx(

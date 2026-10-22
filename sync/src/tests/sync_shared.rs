@@ -9,6 +9,7 @@ use crate::{Relayer, Status, SyncShared, Synchronizer};
 use ckb_chain::{ChainServiceScope, RemoteBlock, VerifyResult};
 use ckb_channel::unbounded;
 use ckb_logger::info;
+use ckb_network::PeerIndex;
 use ckb_shared::block_status::BlockStatus;
 use ckb_shared::{Shared, SharedBuilder};
 use ckb_store::{self, ChainStore};
@@ -68,6 +69,44 @@ fn trim_relay_tx_verify_results_drops_oldest() {
             Byte32::from_slice(&[3; 32]).unwrap(),
             Byte32::from_slice(&[4; 32]).unwrap(),
         ]
+    );
+}
+
+#[test]
+fn refetch_tx_asks_fallback_peers() {
+    let (shared, _pack) = SharedBuilder::with_temp_db().build().unwrap();
+    let (_sender, receiver) = unbounded();
+    let sync_shared = SyncShared::new(shared, Default::default(), receiver);
+    let state = sync_shared.state();
+    let tx_hash = Byte32::from_slice(&[1; 32]).unwrap();
+    let (responder, announcer) = (PeerIndex::new(1), PeerIndex::new(2));
+
+    let _ = state.add_ask_for_txs(responder, vec![tx_hash.clone()]);
+    let _ = state.add_ask_for_txs(announcer, vec![tx_hash.clone()]);
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    assert_eq!(
+        state.pop_ask_for_txs().get(&responder),
+        Some(&vec![tx_hash.clone()])
+    );
+
+    // the responder's body is received, as in `TransactionsProcess`
+    let fallback_peers = state
+        .unknown_tx_hashes()
+        .get_priority(&tx_hash)
+        .unwrap()
+        .fallback_peers();
+    assert_eq!(fallback_peers, vec![announcer]);
+    state.mark_as_known_txs(std::iter::once(tx_hash.clone()));
+    state.add_tx_fallback_peers(tx_hash.clone(), fallback_peers);
+    assert!(state.already_known_tx(&tx_hash));
+
+    // the body is discarded as malformed
+    state.refetch_tx(&tx_hash);
+    assert!(!state.already_known_tx(&tx_hash));
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    assert_eq!(
+        state.pop_ask_for_txs().get(&announcer),
+        Some(&vec![tx_hash.clone()])
     );
 }
 

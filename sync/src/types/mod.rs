@@ -1018,6 +1018,7 @@ impl SyncShared {
             shared_best_header,
             tx_filter: Mutex::new(TtlFilter::default()),
             unknown_tx_hashes: Mutex::new(KeyedPriorityQueue::new()),
+            tx_fallback_peers: Mutex::new(LruCache::new(MAX_UNKNOWN_TX_HASHES_SIZE)),
             peers: Peers::default(),
             pending_get_block_proposals: DashMap::new(),
             pending_compact_blocks: tokio::sync::Mutex::new(HashMap::default()),
@@ -1300,6 +1301,11 @@ impl UnknownTxHashPriority {
             None
         }
     }
+
+    /// Peers which announced the tx, except the one being requested
+    pub fn fallback_peers(&self) -> Vec<PeerIndex> {
+        self.peers.iter().skip(1).cloned().collect()
+    }
 }
 
 impl Ord for UnknownTxHashPriority {
@@ -1323,6 +1329,8 @@ pub struct SyncState {
 
     // The priority is ordering by timestamp (reversed), means do not ask the tx before this timestamp (timeout).
     unknown_tx_hashes: Mutex<KeyedPriorityQueue<Byte32, UnknownTxHashPriority>>,
+    // Other announcers of received txs, used to refetch a tx whose body was discarded as malformed.
+    tx_fallback_peers: Mutex<LruCache<Byte32, Vec<PeerIndex>>>,
 
     /* Status relevant to peers */
     peers: Peers,
@@ -1457,6 +1465,22 @@ impl SyncState {
 
     pub fn remove_from_known_txs(&self, hash: &Byte32) {
         self.tx_filter.lock().remove(hash);
+    }
+
+    pub fn add_tx_fallback_peers(&self, hash: Byte32, peers: Vec<PeerIndex>) {
+        if !peers.is_empty() {
+            self.tx_fallback_peers.lock().put(hash, peers);
+        }
+    }
+
+    /// Forget a tx whose body was discarded as malformed and ask the other announcers for it again.
+    pub fn refetch_tx(&self, hash: &Byte32) {
+        self.remove_from_known_txs(hash);
+        let peers = self.tx_fallback_peers.lock().pop(hash);
+        for peer in peers.into_iter().flatten() {
+            // ignore the per-peer limit status, these peers did nothing wrong
+            let _ = self.add_ask_for_txs(peer, vec![hash.clone()]);
+        }
     }
 
     // maybe someday we can use

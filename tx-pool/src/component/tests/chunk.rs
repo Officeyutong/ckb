@@ -311,7 +311,14 @@ async fn verify_queue_remove() {
     assert!(queue.contains_key(&entry3_id));
     assert!(queue.contains_key(&entry4_id));
 
-    queue.remove_txs_by_peer(&SessionId::new(1));
+    let removed: std::collections::HashSet<_> = queue
+        .remove_txs_by_peer(&SessionId::new(1))
+        .into_iter()
+        .collect();
+    assert_eq!(
+        removed,
+        [entry1.tx.hash(), entry4.tx.hash()].into_iter().collect()
+    );
 
     assert!(!queue.contains_key(&entry1_id));
     assert!(!queue.contains_key(&entry4_id));

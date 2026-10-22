@@ -163,15 +163,8 @@ impl VerifyQueue {
         self.remove_tx(&id)
     }
 
-    /// Remove multiple txs from the queue
-    pub fn remove_txs(&mut self, ids: impl Iterator<Item = ProposalShortId>) {
-        for id in ids {
-            self.remove_tx(&id);
-        }
-    }
-
-    /// Remove multiple txs from the queue from a specified peer
-    pub fn remove_txs_by_peer(&mut self, peer: &PeerIndex) {
+    /// Remove multiple txs from the queue from a specified peer, returns the removed tx hashes
+    pub fn remove_txs_by_peer(&mut self, peer: &PeerIndex) -> Vec<Byte32> {
         let ids: Vec<_> = self
             .inner
             .iter()
@@ -179,7 +172,10 @@ impl VerifyQueue {
             .map(|(_cycle, entry)| entry.id.clone())
             .collect();
 
-        self.remove_txs(ids.into_iter());
+        ids.iter()
+            .filter_map(|id| self.remove_tx(id))
+            .map(|entry| entry.tx.hash())
+            .collect()
     }
 
     /// Returns the first entry in the queue and remove it
