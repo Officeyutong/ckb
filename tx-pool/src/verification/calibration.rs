@@ -1,4 +1,4 @@
-//! Machine calibration for network admission; never a consensus limit.
+//! Machine calibration for local verification budgets; never a consensus limit.
 
 use super::cpu_clock::CpuTime;
 use ckb_script::{ScriptVersion, types::Machine};
@@ -122,7 +122,7 @@ impl Calibration {
     fn measure() -> Self {
         if let Err(error) = CpuTime::now() {
             ckb_logger::warn!(
-                "Network VM CPU budget disabled; thread CPU clock unavailable: {error}"
+                "Tx-pool VM CPU budget disabled; thread CPU clock unavailable: {error}"
             );
             return Self::Unavailable;
         }
@@ -131,13 +131,13 @@ impl Calibration {
                 Some(timing) => Self::Measured(timing),
                 None => {
                     ckb_logger::warn!(
-                        "VM calibration clock resolution is insufficient; using the network CPU cap"
+                        "VM calibration clock resolution is insufficient; using the tx-pool CPU cap"
                     );
                     Self::CapOnly
                 }
             },
             Err(error) => {
-                ckb_logger::warn!("VM calibration failed; using the network CPU cap: {error}");
+                ckb_logger::warn!("VM calibration failed; using the tx-pool CPU cap: {error}");
                 Self::CapOnly
             }
         }
@@ -158,7 +158,7 @@ static VM_TIMING: LazyLock<Calibration> = LazyLock::new(|| {
     let mode = match &calibration {
         Calibration::Measured(timing) => {
             ckb_logger::info!(
-                "Network VM CPU calibration: {} cycles/ms, minimum {} ms",
+                "Tx-pool VM CPU calibration: {} cycles/ms, minimum {} ms",
                 timing.cycles_per_ms,
                 timing.minimum.as_millis(),
             );
@@ -168,7 +168,7 @@ static VM_TIMING: LazyLock<Calibration> = LazyLock::new(|| {
         Calibration::Unavailable => "unavailable",
     };
     let elapsed = started.elapsed();
-    ckb_logger::info!("Network VM CPU calibration mode {mode}, startup cost {elapsed:?}");
+    ckb_logger::info!("Tx-pool VM CPU calibration mode {mode}, startup cost {elapsed:?}");
     if let Some(metrics) = ckb_metrics::handle() {
         metrics
             .ckb_tx_pool_vm_calibration
@@ -191,7 +191,7 @@ pub(crate) fn initialize() {
     LazyLock::force(&VM_TIMING);
 }
 
-/// Network admission policy, shared by relay, proposal and orphan verification.
+/// Local CPU policy for relay, proposal, orphan verification and RPC dry runs.
 /// This cap and the calibration slack are internal policy, not node configuration.
 pub(crate) fn time_limit(declared_cycles: Option<u64>) -> Option<Duration> {
     let cap = Duration::from_secs(ckb_chain_spec::consensus::MIN_BLOCK_INTERVAL);

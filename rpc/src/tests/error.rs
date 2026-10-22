@@ -61,15 +61,15 @@ fn test_submit_transaction_error() {
 }
 
 #[test]
-fn network_verification_timeout_in_local_rpc_is_an_internal_error() {
+fn verification_cpu_budget_refusal_has_a_distinct_rpc_error() {
     assert_eq!(
         serde_json::to_value(RPCError::from_submit_transaction_reject(
             &Reject::ExcessiveVerifyTime
         ))
         .unwrap(),
         serde_json::json!({
-            "code": -1,
-            "message": "CKBInternalError: local submission unexpectedly exhausted a network verification budget",
+            "code": -1113,
+            "message": "PoolRejectedTransactionByVerifyTimeLimit: Transaction verification exceeded the local tx-pool CPU-time limit",
             "data": "ExcessiveVerifyTime"
         })
     );

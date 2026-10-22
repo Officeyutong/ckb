@@ -32,7 +32,7 @@ impl SendLargeCyclesTxInBlock {
 }
 
 impl Spec for SendLargeCyclesTxInBlock {
-    // The network budget must not affect local RPC or canonical block verification.
+    // The CPU budget must not affect local submission or canonical block verification.
     crate::setup!(num_nodes: 2, env: vec![("CKB_TEST_MAX_TX_VERIFY_TIME_MS", "1")]);
 
     fn run(&self, nodes: &mut Vec<Node>) {

@@ -115,6 +115,10 @@ pub enum RPCError {
     PoolRejectedRBF = -1111,
     /// (-1112): The transaction is rejected for ref cell consuming.
     PoolRejectedInvalidated = -1112,
+    /// (-1113): `test_tx_pool_accept` exceeded this node's CKB-VM CPU budget.
+    ///
+    /// This is a retryable resource limit and does not imply consensus invalidity.
+    PoolRejectedTransactionByVerifyTimeLimit = -1113,
     /// (-1200): The indexer error.
     Indexer = -1200,
 }
@@ -173,7 +177,7 @@ impl RPCError {
         }
     }
 
-    /// Creates an RPC error from the reason that a transaction is rejected to be submitted.
+    /// Creates an RPC error from a transaction-pool submission or dry-run refusal.
     pub fn from_submit_transaction_reject(reject: &Reject) -> Error {
         let code = match reject {
             Reject::LowFeeRate(_, _, _) => RPCError::PoolRejectedTransactionByMinFeeRate,
@@ -181,14 +185,7 @@ impl RPCError {
                 RPCError::PoolRejectedTransactionByMaxAncestorsCountLimit
             }
             Reject::Full(_) => RPCError::PoolIsFull,
-            Reject::ExcessiveVerifyTime => {
-                // Local submissions never use the network verification budget.
-                return Self::custom_with_data(
-                    Self::CKBInternalError,
-                    "local submission unexpectedly exhausted a network verification budget",
-                    reject,
-                );
-            }
+            Reject::ExcessiveVerifyTime => RPCError::PoolRejectedTransactionByVerifyTimeLimit,
             Reject::Duplicated(_) => RPCError::PoolRejectedDuplicatedTransaction,
             Reject::Malformed(_, _) => RPCError::PoolRejectedMalformedTransaction,
             Reject::DeclaredWrongCycles(..) => RPCError::PoolRejectedMalformedTransaction,

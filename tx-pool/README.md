@@ -4,13 +4,17 @@ This crate is a component of [ckb](https://github.com/nervosnetwork/ckb).
 
 CKB Tx-pool stores transactions, which is designed for CKB Two Step Transaction Confirmation mechanism
 
-## Network verification CPU budget
+## Verification CPU budget
 
-Relay, proposal-response and network-orphan verification share one CPU budget per
-transaction, across script groups and resumes. Local RPC submission, recovery,
-`test_tx_pool_accept` and canonical block verification keep their existing cycle
-limits. The RPC pool methods are an operator-controlled interface; they are not
-covered by the peer-admission CPU policy.
+Relay, proposal-response, network-orphan verification and `test_tx_pool_accept`
+share one CPU budget per transaction, across script groups and resumes. The dry-run
+RPC has no declared cycles and uses the full CPU cap. Local transaction submission,
+recovery and canonical block verification keep their existing cycle limits.
+
+When `test_tx_pool_accept` exhausts its CPU budget, it returns
+`PoolRejectedTransactionByVerifyTimeLimit (-1113)`. This is a retryable resource
+refusal, not consensus invalidity. Neither successful nor refused dry runs admit
+the transaction, relay it or persist a rejection.
 
 Only CPU time measured on the execution thread spends the budget. Queueing,
 suspension and time spent descheduled or blocked do not. A wall timer requests a

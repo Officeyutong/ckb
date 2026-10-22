@@ -104,13 +104,13 @@ pub struct Metrics {
     pub ckb_tx_pool_sync_process: Histogram,
     /// Histogram for async process tx in txpool
     pub ckb_tx_pool_async_process: Histogram,
-    /// Current network VM budget mode: calibrated, cap_only or unavailable.
+    /// Current VM CPU budget mode: calibrated, cap_only or unavailable.
     pub ckb_tx_pool_vm_calibration: IntGaugeVec,
     /// Wall time spent initializing the process-wide VM calibration.
     pub ckb_tx_pool_vm_calibration_seconds: Gauge,
     /// Calibrated consensus cycles per millisecond, including policy slack.
     pub ckb_tx_pool_vm_cycles_per_ms: Gauge,
-    /// Network transactions refused after exhausting their local CPU budget.
+    /// Transaction verifications refused after exhausting their local CPU budget.
     pub ckb_tx_pool_vm_cpu_budget_refusals_total: IntCounter,
     /// Failed execution-thread CPU readings after the budget was enabled.
     pub ckb_tx_pool_vm_cpu_clock_failures_total: IntCounter,
@@ -264,7 +264,7 @@ static METRICS: std::sync::LazyLock<Metrics> = std::sync::LazyLock::new(|| {
     .unwrap(),
     ckb_tx_pool_vm_calibration: register_int_gauge_vec!(
         "ckb_tx_pool_vm_calibration",
-        "The active network VM CPU budget mode",
+        "The active VM CPU budget mode",
         &["mode"]
     ).unwrap(),
     ckb_tx_pool_vm_calibration_seconds: register_gauge!(
@@ -277,7 +277,7 @@ static METRICS: std::sync::LazyLock<Metrics> = std::sync::LazyLock::new(|| {
     ).unwrap(),
     ckb_tx_pool_vm_cpu_budget_refusals_total: register_int_counter!(
         "ckb_tx_pool_vm_cpu_budget_refusals_total",
-        "Network transactions refused by their local VM CPU budget"
+        "Transaction verifications refused by their local VM CPU budget"
     ).unwrap(),
     ckb_tx_pool_vm_cpu_clock_failures_total: register_int_counter!(
         "ckb_tx_pool_vm_cpu_clock_failures_total",

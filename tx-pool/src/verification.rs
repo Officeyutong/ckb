@@ -1,4 +1,4 @@
-//! Canonical verification entry point and local CPU budgets for network transactions.
+//! Canonical verification and CPU budgets for network transactions and RPC dry runs.
 
 pub(crate) mod calibration;
 mod cpu_clock;
@@ -56,7 +56,7 @@ pub(crate) async fn verify_rtx(
             .map_err(Reject::Verification),
         (command_rx, cpu_time_limit) => {
             let verifier = new_verifier().map_err(Reject::Verification)?;
-            // Direct network orphans have a budget but no worker control channel.
+            // RPC dry runs and direct orphans have no worker control channel.
             let mut resume_channel;
             let command_rx = match command_rx {
                 Some(command_rx) => command_rx,

@@ -23,7 +23,7 @@ const DIRECT_ORPHAN_CYCLES: u64 = 1_000_000_000;
 pub struct NetworkVerificationTimeBudget;
 
 impl Spec for NetworkVerificationTimeBudget {
-    crate::setup!(env: vec![("CKB_TEST_MAX_TX_VERIFY_TIME_MS", "1")]);
+    crate::setup!(num_nodes: 1);
 
     fn modify_app_config(&self, config: &mut ckb_app_config::CKBAppConfig) {
         config.network.connect_outbound_interval_secs = 0;
@@ -39,9 +39,31 @@ impl Spec for NetworkVerificationTimeBudget {
     }
 
     fn run(&self, nodes: &mut Vec<Node>) {
-        let node = &nodes[0];
+        let node = &mut nodes[0];
         let (funding, tx, cycles) = fund_budget_workload(node);
+        // Validate the dry run under the production cap, then restart with the
+        // test cap. The budget is process-local and is never node configuration.
+        node.stop();
+        node.start_with_env(&[("CKB_TEST_MAX_TX_VERIFY_TIME_MS", "1")]);
         let rpc = node.rpc_client();
+        rpc.remove_transaction(funding.hash());
+        node.submit_transaction(&funding);
+        let pool_before = rpc.get_raw_tx_pool(None);
+        for _ in 0..2 {
+            let error = rpc
+                .inner()
+                .test_tx_pool_accept(tx.data().into(), Some("passthrough".into()))
+                .unwrap_err();
+            let error: jsonrpc_core::Error = serde_json::from_str(&error.to_string())
+                .expect("the refusal must be a JSON-RPC error");
+            assert_eq!(error.code, jsonrpc_core::ErrorCode::ServerError(-1113));
+            assert_eq!(rpc.get_raw_tx_pool(None), pool_before);
+            assert_eq!(
+                rpc.get_transaction(tx.hash()).tx_status.status,
+                ckb_jsonrpc_types::Status::Unknown,
+                "a dry-run refusal must not become a persistent rejection"
+            );
+        }
         let mut net = Net::new(
             self.name(),
             node.consensus(),
@@ -89,8 +111,10 @@ impl Spec for NetworkVerificationTimeBudget {
         assert_network_refusal(&net, node, &tx.hash());
 
         assert_eq!(node.submit_transaction(&tx), tx.hash());
+        let submitted = rpc.get_transaction(tx.hash());
+        assert_eq!(submitted.cycles.map(|cycles| cycles.value()), Some(cycles));
         assert_eq!(
-            rpc.get_transaction(tx.hash()).tx_status.status,
+            submitted.tx_status.status,
             ckb_jsonrpc_types::Status::Pending
         );
         // The compact block already proposed the transaction; mine the gap
@@ -110,7 +134,7 @@ impl Spec for NetworkVerificationTimeBudget {
 }
 
 // Prepare a valid workload that takes the direct orphan route and exceeds the
-// test-only time cap. The dry-run resolves its parent without warming the cache.
+// test-only time cap. The dry run uses the production cap to resolve its parent.
 fn fund_budget_workload(node: &Node) -> (TransactionView, TransactionView, Cycle) {
     node.mine_until_out_bootstrap_period();
     // Four cellbase rewards fund the 64 output cells.
@@ -171,14 +195,19 @@ fn fund_budget_workload(node: &Node) -> (TransactionView, TransactionView, Cycle
         .set_outputs(outputs)
         .set_outputs_data(vec![Bytes::new().pack(); 64])
         .build();
-    // Dry-run against the pool so the uncommitted parent resolves. This
-    // verifies scripts without admitting the transaction or caching cycles.
-    let cycles = rpc
+    // A successful dry run reports cycles and fees without admitting the tx.
+    let pool_before = rpc.get_raw_tx_pool(None);
+    let completed = rpc
         .inner()
         .test_tx_pool_accept(tx.data().into(), Some("passthrough".into()))
-        .expect("the workload is valid with its parent in the pool")
-        .cycles
-        .value();
+        .expect("the workload fits the production CPU cap");
+    assert_eq!(completed.fee.value(), capacity_bytes!(100).as_u64());
+    assert_eq!(rpc.get_raw_tx_pool(None), pool_before);
+    assert_eq!(
+        rpc.get_transaction(tx.hash()).tx_status.status,
+        ckb_jsonrpc_types::Status::Unknown
+    );
+    let cycles = completed.cycles.value();
     assert!(
         cycles <= DIRECT_ORPHAN_CYCLES,
         "the orphan must take the direct verification path"

@@ -401,7 +401,7 @@ impl TxPoolService {
             debug!("reject tx {} already in orphan pool", tx.hash());
             return Err(Reject::Duplicated(tx.hash()));
         }
-        self._test_accept_tx(tx.clone()).await
+        self._test_accept_tx(tx).await
     }
 
     pub(crate) async fn process_tx(
@@ -818,7 +818,7 @@ impl TxPoolService {
             &verify_cache,
             max_cycles,
             None,
-            None,
+            calibration::time_limit(None),
         )
         .await
     }
