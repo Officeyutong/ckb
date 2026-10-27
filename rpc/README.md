@@ -1335,7 +1335,9 @@ Response
     * `tx_proof`: [`TransactionProof`](#type-transactionproof)
 * result: `Array<` [`H256`](#type-h256) `>`
 
-Verifies that a proof points to transactions in a block, returning the transaction hashes it commits to.
+Verifies that a proof points to transactions in a block on the main chain, returning the transaction hashes it commits to.
+
+Returns an error if the block is not found or is not on the main chain, e.g. an uncle or a fork block.
 
 ###### Parameters
 
@@ -1432,7 +1434,9 @@ Response
     * `tx_proof`: [`TransactionAndWitnessProof`](#type-transactionandwitnessproof)
 * result: `Array<` [`H256`](#type-h256) `>`
 
-Verifies that a proof points to transactions in a block, returning the transaction hashes it commits to.
+Verifies that a proof points to transactions in a block on the main chain, returning the transaction hashes it commits to.
+
+Returns an error if the block is not found or is not on the main chain, e.g. an uncle or a fork block.
 
 ###### Parameters
 

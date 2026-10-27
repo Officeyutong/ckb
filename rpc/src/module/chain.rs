@@ -1064,7 +1064,9 @@ pub trait ChainRpc {
         block_hash: Option<H256>,
     ) -> Result<TransactionProof>;
 
-    /// Verifies that a proof points to transactions in a block, returning the transaction hashes it commits to.
+    /// Verifies that a proof points to transactions in a block on the main chain, returning the transaction hashes it commits to.
+    ///
+    /// Returns an error if the block is not found or is not on the main chain, e.g. an uncle or a fork block.
     ///
     /// ## Parameters
     ///
@@ -1156,7 +1158,9 @@ pub trait ChainRpc {
         block_hash: Option<H256>,
     ) -> Result<TransactionAndWitnessProof>;
 
-    /// Verifies that a proof points to transactions in a block, returning the transaction hashes it commits to.
+    /// Verifies that a proof points to transactions in a block on the main chain, returning the transaction hashes it commits to.
+    ///
+    /// Returns an error if the block is not found or is not on the main chain, e.g. an uncle or a fork block.
     ///
     /// ## Parameters
     ///
@@ -1939,56 +1943,51 @@ impl ChainRpc for ChainRpcImpl {
     fn verify_transaction_proof(&self, tx_proof: TransactionProof) -> Result<Vec<H256>> {
         let snapshot = self.shared.snapshot();
 
-        snapshot
-            .get_block(&(&tx_proof.block_hash).into())
-            .ok_or_else(|| {
-                RPCError::invalid_params(format!("Cannot find block {:#x}", tx_proof.block_hash))
-            })
-            .and_then(|block| {
-                let witnesses_root = tx_proof.witnesses_root.into();
-                let indices: Vec<u32> = tx_proof
+        Self::get_main_chain_block(&snapshot, &tx_proof.block_hash).and_then(|block| {
+            let witnesses_root = tx_proof.witnesses_root.into();
+            let indices: Vec<u32> = tx_proof
+                .proof
+                .indices
+                .into_iter()
+                .map(|index| index.value())
+                .collect();
+
+            // Reject empty, duplicate, or oversized indices.
+            if indices.is_empty() || indices.len() > block.transactions().len() || {
+                let mut uniq = HashSet::new();
+                indices.iter().any(|idx| !uniq.insert(*idx))
+            } {
+                return Err(RPCError::invalid_params(
+                    "Invalid transaction proof indices",
+                ));
+            }
+
+            let merkle_proof = MerkleProof::new(
+                indices,
+                tx_proof
                     .proof
-                    .indices
+                    .lemmas
                     .into_iter()
-                    .map(|index| index.value())
-                    .collect();
+                    .map(|lemma| lemma.into())
+                    .collect(),
+            );
 
-                // Reject empty, duplicate, or oversized indices.
-                if indices.is_empty() || indices.len() > block.transactions().len() || {
-                    let mut uniq = HashSet::new();
-                    indices.iter().any(|idx| !uniq.insert(*idx))
-                } {
-                    return Err(RPCError::invalid_params(
-                        "Invalid transaction proof indices",
-                    ));
-                }
-
-                let merkle_proof = MerkleProof::new(
-                    indices,
-                    tx_proof
-                        .proof
-                        .lemmas
-                        .into_iter()
-                        .map(|lemma| lemma.into())
-                        .collect(),
-                );
-
-                CBMT::retrieve_leaves(block.tx_hashes(), &merkle_proof)
-                    .and_then(|tx_hashes| {
-                        merkle_proof
-                            .root(&tx_hashes)
-                            .and_then(|raw_transactions_root| {
-                                if block.transactions_root()
-                                    == merkle_root(&[raw_transactions_root, witnesses_root])
-                                {
-                                    Some(tx_hashes.iter().map(|hash| hash.into()).collect())
-                                } else {
-                                    None
-                                }
-                            })
-                    })
-                    .ok_or_else(|| RPCError::invalid_params("Invalid transaction proof"))
-            })
+            CBMT::retrieve_leaves(block.tx_hashes(), &merkle_proof)
+                .and_then(|tx_hashes| {
+                    merkle_proof
+                        .root(&tx_hashes)
+                        .and_then(|raw_transactions_root| {
+                            if block.transactions_root()
+                                == merkle_root(&[raw_transactions_root, witnesses_root])
+                            {
+                                Some(tx_hashes.iter().map(|hash| hash.into()).collect())
+                            } else {
+                                None
+                            }
+                        })
+                })
+                .ok_or_else(|| RPCError::invalid_params("Invalid transaction proof"))
+        })
     }
 
     fn get_transaction_and_witness_proof(
@@ -2020,101 +2019,95 @@ impl ChainRpc for ChainRpcImpl {
         tx_proof: TransactionAndWitnessProof,
     ) -> Result<Vec<H256>> {
         let snapshot = self.shared.snapshot();
-        snapshot
-            .get_block(&(&tx_proof.block_hash).into())
-            .ok_or_else(|| {
-                RPCError::invalid_params(format!("Cannot find block {:#x}", tx_proof.block_hash))
-            })
-            .and_then(|block| {
-                let tx_indices: Vec<u32> = tx_proof
-                    .transactions_proof
-                    .indices
-                    .into_iter()
-                    .map(|index| index.value())
-                    .collect();
-                let witness_indices: Vec<u32> = tx_proof
-                    .witnesses_proof
-                    .indices
-                    .into_iter()
-                    .map(|index| index.value())
-                    .collect();
+        Self::get_main_chain_block(&snapshot, &tx_proof.block_hash).and_then(|block| {
+            let tx_indices: Vec<u32> = tx_proof
+                .transactions_proof
+                .indices
+                .into_iter()
+                .map(|index| index.value())
+                .collect();
+            let witness_indices: Vec<u32> = tx_proof
+                .witnesses_proof
+                .indices
+                .into_iter()
+                .map(|index| index.value())
+                .collect();
 
-                // Reject empty, duplicate, or oversized transaction proof indices.
-                if tx_indices.is_empty() || tx_indices.len() > block.transactions().len() || {
+            // Reject empty, duplicate, or oversized transaction proof indices.
+            if tx_indices.is_empty() || tx_indices.len() > block.transactions().len() || {
+                let mut uniq = HashSet::new();
+                tx_indices.iter().any(|idx| !uniq.insert(*idx))
+            } {
+                return Err(RPCError::invalid_params(
+                    "Invalid transaction proof indices",
+                ));
+            }
+
+            // Reject empty, duplicate, or oversized witness proof indices.
+            if witness_indices.is_empty()
+                || witness_indices.len() > block.tx_witness_hashes().len()
+                || {
                     let mut uniq = HashSet::new();
-                    tx_indices.iter().any(|idx| !uniq.insert(*idx))
-                } {
+                    witness_indices.iter().any(|idx| !uniq.insert(*idx))
+                }
+            {
+                return Err(RPCError::invalid_params("Invalid witness proof indices"));
+            }
+
+            // After deduplication the two index sets must match.
+            {
+                let tx_set: HashSet<u32> = tx_indices.iter().copied().collect();
+                let witness_set: HashSet<u32> = witness_indices.iter().copied().collect();
+                if tx_set != witness_set {
                     return Err(RPCError::invalid_params(
-                        "Invalid transaction proof indices",
+                        "Transaction proof indices do not match witness proof indices",
                     ));
                 }
+            }
 
-                // Reject empty, duplicate, or oversized witness proof indices.
-                if witness_indices.is_empty()
-                    || witness_indices.len() > block.tx_witness_hashes().len()
-                    || {
-                        let mut uniq = HashSet::new();
-                        witness_indices.iter().any(|idx| !uniq.insert(*idx))
-                    }
-                {
-                    return Err(RPCError::invalid_params("Invalid witness proof indices"));
-                }
+            let transactions_merkle_proof = MerkleProof::new(
+                tx_indices,
+                tx_proof
+                    .transactions_proof
+                    .lemmas
+                    .into_iter()
+                    .map(|lemma| lemma.into())
+                    .collect(),
+            );
+            let witnesses_merkle_proof = MerkleProof::new(
+                witness_indices,
+                tx_proof
+                    .witnesses_proof
+                    .lemmas
+                    .into_iter()
+                    .map(|lemma| lemma.into())
+                    .collect(),
+            );
 
-                // After deduplication the two index sets must match.
-                {
-                    let tx_set: HashSet<u32> = tx_indices.iter().copied().collect();
-                    let witness_set: HashSet<u32> = witness_indices.iter().copied().collect();
-                    if tx_set != witness_set {
-                        return Err(RPCError::invalid_params(
-                            "Transaction proof indices do not match witness proof indices",
-                        ));
-                    }
-                }
-
-                let transactions_merkle_proof = MerkleProof::new(
-                    tx_indices,
-                    tx_proof
-                        .transactions_proof
-                        .lemmas
-                        .into_iter()
-                        .map(|lemma| lemma.into())
-                        .collect(),
-                );
-                let witnesses_merkle_proof = MerkleProof::new(
-                    witness_indices,
-                    tx_proof
-                        .witnesses_proof
-                        .lemmas
-                        .into_iter()
-                        .map(|lemma| lemma.into())
-                        .collect(),
-                );
-
-                CBMT::retrieve_leaves(block.tx_witness_hashes(), &witnesses_merkle_proof)
-                    .and_then(|witnesses_hashes| witnesses_merkle_proof.root(&witnesses_hashes))
-                    .and_then(|witnesses_proof_root| {
-                        CBMT::retrieve_leaves(block.tx_hashes(), &transactions_merkle_proof)
-                            .and_then(|tx_hashes| {
-                                transactions_merkle_proof.root(&tx_hashes).and_then(
-                                    |raw_transactions_root| {
-                                        if block.transactions_root()
-                                            == merkle_root(&[
-                                                raw_transactions_root,
-                                                witnesses_proof_root,
-                                            ])
-                                        {
-                                            Some(tx_hashes.iter().map(|hash| hash.into()).collect())
-                                        } else {
-                                            None
-                                        }
-                                    },
-                                )
-                            })
-                    })
-                    .ok_or_else(|| {
-                        RPCError::invalid_params("Invalid transaction_and_witness proof")
-                    })
-            })
+            CBMT::retrieve_leaves(block.tx_witness_hashes(), &witnesses_merkle_proof)
+                .and_then(|witnesses_hashes| witnesses_merkle_proof.root(&witnesses_hashes))
+                .and_then(|witnesses_proof_root| {
+                    CBMT::retrieve_leaves(block.tx_hashes(), &transactions_merkle_proof).and_then(
+                        |tx_hashes| {
+                            transactions_merkle_proof.root(&tx_hashes).and_then(
+                                |raw_transactions_root| {
+                                    if block.transactions_root()
+                                        == merkle_root(&[
+                                            raw_transactions_root,
+                                            witnesses_proof_root,
+                                        ])
+                                    {
+                                        Some(tx_hashes.iter().map(|hash| hash.into()).collect())
+                                    } else {
+                                        None
+                                    }
+                                },
+                            )
+                        },
+                    )
+                })
+                .ok_or_else(|| RPCError::invalid_params("Invalid transaction_and_witness proof"))
+        })
     }
 
     fn get_fork_block(
@@ -2324,6 +2317,20 @@ impl ChainRpcImpl {
                 BlockResponse::regular(block)
             }
         }))
+    }
+
+    // Proofs are only meaningful against the canonical chain, a block that is stored but not
+    // on the main chain (e.g. an uncle or a detached fork block) is rejected like a missing one.
+    fn get_main_chain_block(snapshot: &Snapshot, block_hash: &H256) -> Result<core::BlockView> {
+        let hash: packed::Byte32 = block_hash.into();
+        if !snapshot.is_main_chain(&hash) {
+            return Err(RPCError::invalid_params(format!(
+                "Cannot find block {block_hash:#x} on the main chain"
+            )));
+        }
+        snapshot
+            .get_block(&hash)
+            .ok_or_else(|| RPCError::invalid_params(format!("Cannot find block {block_hash:#x}")))
     }
 
     fn get_tx_indices(
