@@ -10,6 +10,34 @@ use crate::{
 use std::collections::HashSet;
 
 #[test]
+fn test_ignore_addr_empty_after_base_addr() {
+    let mut peer_store: PeerStore = Default::default();
+    // Discovery accepts these as valid multiaddrs, but they become empty once
+    // transport-only protocols are stripped before storing.
+    let addrs = [
+        "/ws",
+        "/wss",
+        "/memory/1",
+        "/ws/memory/1",
+        "/tls/example.com/wss",
+    ]
+    .iter()
+    .map(|addr| addr.parse::<Multiaddr>().unwrap())
+    .chain(std::iter::once(Multiaddr::try_from(Vec::new()).unwrap()));
+    for addr in addrs {
+        peer_store
+            .add_addr(addr.clone(), Flags::COMPATIBILITY)
+            .unwrap();
+        peer_store.add_outbound_addr(addr, Flags::COMPATIBILITY);
+    }
+    assert_eq!(peer_store.addr_manager().count(), 0);
+
+    let addr = random_addr();
+    peer_store.add_addr(addr, Flags::COMPATIBILITY).unwrap();
+    assert_eq!(peer_store.addr_manager().count(), 1);
+}
+
+#[test]
 fn test_add_connected_peer() {
     let mut peer_store: PeerStore = Default::default();
     let addr = random_addr();
