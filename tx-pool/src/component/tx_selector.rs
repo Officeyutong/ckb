@@ -173,6 +173,9 @@ impl<'a> TxSelector<'a> {
 
             // prepare to package tx with ancestors
             let ancestors_ids = self.pool_map.calc_ancestors(&short_id);
+            // An entry with a non-proposed ancestor says nothing about how full the block is,
+            // so it is not counted in `consecutive_failed`. Otherwise such entries ranked above
+            // valid ones could end the selection early.
             if ancestors_ids
                 .iter()
                 .any(|id| !self.pool_map.has_proposed(id))
@@ -180,10 +183,6 @@ impl<'a> TxSelector<'a> {
                 if using_modified {
                     self.modified_entries.remove(&short_id);
                     self.failed_txs.insert(short_id.clone());
-                }
-                consecutive_failed += 1;
-                if consecutive_failed > MAX_CONSECUTIVE_FAILURES {
-                    break;
                 }
                 continue;
             }
@@ -218,6 +217,7 @@ impl<'a> TxSelector<'a> {
             }
 
             self.update_modified_entries(&ancestors);
+            consecutive_failed = 0;
         }
         (self.entries, size, cycles)
     }

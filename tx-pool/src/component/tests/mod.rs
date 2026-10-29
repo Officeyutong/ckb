@@ -8,4 +8,5 @@ mod proposed;
 mod recent_reject;
 mod score_key;
 mod transaction_hash;
+mod tx_selector;
 mod util;
