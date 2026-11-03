@@ -87,19 +87,17 @@ impl<'a> GetBlockTransactionsProcess<'a> {
                 .message
                 .indexes()
                 .iter()
-                .filter_map(|i| {
-                    block
-                        .transactions()
-                        .get(Into::<u32>::into(i) as usize)
-                        .cloned()
-                })
+                // `transaction(i)` reads one transaction, `transactions()` would rebuild
+                // the whole list for every requested index
+                .filter_map(|i| block.transaction(Into::<u32>::into(i) as usize))
                 .collect::<Vec<_>>();
 
+            let block_uncles = block.uncles();
             let uncles = self
                 .message
                 .uncle_indexes()
                 .iter()
-                .filter_map(|i| block.uncles().get(Into::<u32>::into(i) as usize))
+                .filter_map(|i| block_uncles.get(Into::<u32>::into(i) as usize))
                 .collect::<Vec<_>>();
 
             let content = packed::BlockTransactions::new_builder()
