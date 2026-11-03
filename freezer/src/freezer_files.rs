@@ -30,6 +30,9 @@ impl Head {
 
     pub fn write(&mut self, data: &[u8]) -> Result<(), IoError> {
         fail_point!("write-head");
+        // The head file shares its offset with the clone cached in `FreezerFiles::files`,
+        // which `retrieve` seeks for reading, so always write at the end of written data
+        self.file.seek(SeekFrom::Start(self.bytes))?;
         self.file.write_all(data)?;
         self.bytes += data.len() as u64;
         Ok(())
