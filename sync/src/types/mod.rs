@@ -46,6 +46,11 @@ use std::time::{Duration, Instant};
 use std::{cmp, fmt, iter};
 
 const GET_HEADERS_CACHE_SIZE: usize = 10000;
+
+/// Upper bound on the number of parent headers walked when locating the common
+/// ancestor from a stored side-chain locator entry. Without a budget, a peer
+/// that has built a deep side chain can make every GetHeaders request walk it.
+const MAX_LOCATOR_WALK_STEPS: usize = 10_000;
 // TODO: Need discussed
 const GET_HEADERS_TIMEOUT: Duration = Duration::from_secs(15);
 const FILTER_SIZE: usize = 50000;
@@ -1889,6 +1894,21 @@ impl ActiveChain {
         _hash_stop: &Byte32,
         locator: &[Byte32],
     ) -> Option<BlockNumber> {
+        self.locate_latest_common_block_with_walk_budget(
+            _hash_stop,
+            locator,
+            MAX_LOCATOR_WALK_STEPS,
+        )
+    }
+
+    /// Same as [`Self::locate_latest_common_block`], with an explicit budget for the parent walk
+    /// from a stored side-chain locator entry.
+    pub(crate) fn locate_latest_common_block_with_walk_budget(
+        &self,
+        _hash_stop: &Byte32,
+        locator: &[Byte32],
+        max_walk_steps: usize,
+    ) -> Option<BlockNumber> {
         let locator_hash = locator.last()?;
         if locator_hash != &self.sync_shared.consensus().genesis_hash() {
             return None;
@@ -1909,22 +1929,33 @@ impl ActiveChain {
             .get(index - 1)
             .and_then(|hash| self.sync_shared.store().get_block_header(hash))
         {
-            let mut block_hash = header.data().raw().parent_hash();
-            loop {
-                let block_header = match self.sync_shared.store().get_block_header(&block_hash) {
-                    None => break Some(latest_common),
-                    Some(block_header) => block_header,
-                };
-
-                if let Some(block_number) = self.snapshot.get_block_number(&block_hash) {
-                    return Some(block_number);
-                }
-
-                block_hash = block_header.data().raw().parent_hash();
+            if let Some(block_number) =
+                self.walk_parent_headers(&header.data().raw().parent_hash(), max_walk_steps)
+            {
+                return Some(block_number);
             }
+            debug!(
+                "locate_latest_common_block gave up after {} parent steps, fall back to locator entry",
+                max_walk_steps,
+            );
+            Some(latest_common)
         } else {
             Some(latest_common)
         }
+    }
+
+    /// Follow parent headers from `block_hash` until a block on the main chain
+    /// is found, or return `None` after `max_steps` hops or a missing header.
+    fn walk_parent_headers(&self, block_hash: &Byte32, max_steps: usize) -> Option<BlockNumber> {
+        let mut block_hash = block_hash.clone();
+        for _ in 0..max_steps {
+            let block_header = self.sync_shared.store().get_block_header(&block_hash)?;
+            if let Some(block_number) = self.snapshot.get_block_number(&block_hash) {
+                return Some(block_number);
+            }
+            block_hash = block_header.data().raw().parent_hash();
+        }
+        None
     }
 
     pub fn get_locator_response(
