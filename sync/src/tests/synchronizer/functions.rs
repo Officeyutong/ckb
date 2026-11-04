@@ -1,7 +1,8 @@
 use ckb_chain::{ChainController, ChainServiceScope};
 use ckb_chain_spec::consensus::{Consensus, ConsensusBuilder};
 use ckb_constant::sync::{
-    CHAIN_SYNC_TIMEOUT, EVICTION_HEADERS_RESPONSE_TIME, MAX_LOCATOR_SIZE, MAX_TIP_AGE,
+    CHAIN_SYNC_TIMEOUT, EVICTION_HEADERS_RESPONSE_TIME, MAX_HEADERS_LEN, MAX_LOCATOR_SIZE,
+    MAX_TIP_AGE,
 };
 use ckb_dao::DaoCalculator;
 use ckb_error::InternalErrorKind;
@@ -1377,6 +1378,23 @@ fn get_headers_rejects_oversized_locator_before_processing() {
             MAX_LOCATOR_SIZE + 1
         )
     );
+}
+
+#[test]
+fn headers_process_rejects_oversized_headers() {
+    let (_chain, _shared, synchronizer) = start_chain(Some(Consensus::default()));
+    let message = SendHeadersBuilder::default()
+        .headers(vec![packed::Header::default(); MAX_HEADERS_LEN + 1])
+        .build();
+    let nc = Arc::new(mock_network_context(1)) as Arc<dyn CKBProtocolContext + Sync + 'static>;
+
+    let status = HeadersProcess::new(message.as_reader(), &synchronizer, 0.into(), &nc).execute();
+
+    assert_eq!(
+        status,
+        StatusCode::HeadersIsInvalid.with_context("oversize")
+    );
+    assert!(status.should_ban().is_some());
 }
 
 #[test]

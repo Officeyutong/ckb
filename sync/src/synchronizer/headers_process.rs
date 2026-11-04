@@ -95,20 +95,14 @@ impl<'a> HeadersProcess<'a> {
         debug!("HeadersProcess begins");
         let shared: &SyncShared = self.synchronizer.shared();
         let consensus = shared.consensus();
-        let headers = self
-            .message
-            .headers()
-            .to_entity()
-            .into_iter()
-            .map(packed::Header::into_view)
-            .collect::<Vec<_>>();
-
-        if headers.len() > MAX_HEADERS_LEN {
+        let headers_reader = self.message.headers();
+        // Check the count on the reader, so an oversized message is rejected before any conversion
+        if headers_reader.len() > MAX_HEADERS_LEN {
             warn!("HeadersProcess is oversized");
             return StatusCode::HeadersIsInvalid.with_context("oversize");
         }
 
-        if headers.is_empty() {
+        if headers_reader.is_empty() {
             // Empty means that the other peer's tip may be consistent with our own best known,
             // but empty cannot 100% confirm this, so it does not set the other peer's best header
             // to the shared best known.
@@ -123,6 +117,12 @@ impl<'a> HeadersProcess<'a> {
             }
             return Status::ok();
         }
+
+        let headers = headers_reader
+            .to_entity()
+            .into_iter()
+            .map(packed::Header::into_view)
+            .collect::<Vec<_>>();
 
         if !self.is_continuous(&headers) {
             warn!("HeadersProcess is not continuous");
