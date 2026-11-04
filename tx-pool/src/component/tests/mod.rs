@@ -1,6 +1,7 @@
 mod chunk;
 mod entry;
 mod estimate;
+mod late_parent_capacity;
 mod links;
 mod orphan;
 mod pending;

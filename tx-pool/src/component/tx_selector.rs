@@ -204,6 +204,31 @@ impl<'a> TxSelector<'a> {
                 .map(|entry| (entry.proposal_short_id(), entry))
                 .collect();
 
+            // A late parent can leave a child's cached ancestor totals short
+            // of its actual closure. The cache is useful for ordering and the
+            // quick check above, but only this expanded package can authorize
+            // bytes and cycles for the block.
+            let fits = ancestors
+                .values()
+                .try_fold((size, cycles), |(bytes, cycles), entry| {
+                    Some((
+                        bytes.checked_add(entry.size)?,
+                        cycles.checked_add(entry.cycles)?,
+                    ))
+                })
+                .is_some_and(|(bytes, cycles)| bytes <= size_limit && cycles <= cycles_limit);
+            if !fits {
+                if using_modified {
+                    self.modified_entries.remove(&short_id);
+                    self.failed_txs.insert(short_id.clone());
+                }
+                consecutive_failed += 1;
+                if consecutive_failed > MAX_CONSECUTIVE_FAILURES {
+                    break;
+                }
+                continue;
+            }
+
             for (short_id, entry) in &ancestors {
                 let is_new = self.fetched_txs.insert(short_id.clone());
                 if !is_new {
