@@ -186,3 +186,47 @@ fn test_peer_store_dump_with_broken_tmp_file_should_be_ok() {
     assert_eq!(1, peer_store.ban_list().count());
     assert_eq!(3, peer_store.addr_manager().count());
 }
+
+#[test]
+fn test_peer_store_load_skips_invalid_addr_entry() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut peer_store = PeerStore::default();
+    for i in 0..3 {
+        let addr: Multiaddr = format!(
+            "/ip4/127.0.0.1/tcp/{}/p2p/{}",
+            i,
+            PeerId::random().to_base58()
+        )
+        .parse()
+        .unwrap();
+        peer_store
+            .mut_addr_manager()
+            .add(AddrInfo::new(addr, 0, 60, 0));
+    }
+    // An address that collapses to empty must not be stored or dumped
+    peer_store
+        .mut_addr_manager()
+        .add(AddrInfo::new("/ws".parse().unwrap(), 0, 60, 0));
+    assert_eq!(3, peer_store.addr_manager().count());
+    peer_store.dump_to_dir(dir.as_ref()).unwrap();
+    assert_eq!(
+        3,
+        PeerStore::load_from_dir_or_default(dir.as_ref())
+            .addr_manager()
+            .count()
+    );
+
+    // A db written by an older version may contain an undecodable entry,
+    // it should be skipped instead of discarding the whole address list
+    let db_path = dir.as_ref().join("addr_manager.db");
+    let mut entries: Vec<serde_json::Value> =
+        serde_json::from_reader(File::open(&db_path).unwrap()).unwrap();
+    let mut invalid = entries[0].clone();
+    invalid["addr"] = serde_json::Value::String(String::new());
+    entries.push(invalid);
+    std::fs::write(&db_path, serde_json::to_string(&entries).unwrap()).unwrap();
+
+    let peer_store = PeerStore::load_from_dir_or_default(dir.as_ref());
+    assert_eq!(3, peer_store.addr_manager().count());
+}
