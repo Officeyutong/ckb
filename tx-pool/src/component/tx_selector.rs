@@ -146,88 +146,19 @@ impl<'a> TxSelector<'a> {
             };
 
             let short_id = tx_entry.proposal_short_id();
-            let next_size = size.saturating_add(tx_entry.ancestors_size);
-            let next_cycles = cycles.saturating_add(tx_entry.ancestors_cycles);
-
-            if next_cycles > cycles_limit || next_size > size_limit {
-                consecutive_failed += 1;
+            let Some(ancestors) =
+                self.prepare_package(tx_entry, size, cycles, size_limit, cycles_limit)
+            else {
                 if using_modified {
                     self.modified_entries.remove(&short_id);
-                    self.failed_txs.insert(short_id.clone());
+                    self.failed_txs.insert(short_id);
                 }
+                consecutive_failed += 1;
                 if consecutive_failed > MAX_CONSECUTIVE_FAILURES {
                     break;
                 }
                 continue;
-            }
-
-            let only_unconfirmed = |short_id| {
-                if self.fetched_txs.contains(short_id) {
-                    None
-                } else {
-                    let entry = self.retrieve_entry(short_id);
-                    debug_assert!(entry.is_some(), "pool should be consistent");
-                    entry
-                }
             };
-
-            // prepare to package tx with ancestors
-            let ancestors_ids = self.pool_map.calc_ancestors(&short_id);
-            if ancestors_ids
-                .iter()
-                .any(|id| !self.pool_map.has_proposed(id))
-            {
-                if using_modified {
-                    self.modified_entries.remove(&short_id);
-                    self.failed_txs.insert(short_id.clone());
-                }
-                consecutive_failed += 1;
-                if consecutive_failed > MAX_CONSECUTIVE_FAILURES {
-                    break;
-                }
-                continue;
-            }
-
-            let mut ancestors = ancestors_ids
-                .iter()
-                .filter_map(only_unconfirmed)
-                .cloned()
-                .collect::<Vec<TxEntry>>();
-
-            // sort ancestors by ancestors_count,
-            // if A is an ancestor of B, B.ancestors_count must large than A
-            ancestors.sort_unstable_by_key(|entry| entry.ancestors_count);
-            ancestors.push(tx_entry.to_owned());
-
-            let ancestors: LinkedHashMap<ProposalShortId, TxEntry> = ancestors
-                .into_iter()
-                .map(|entry| (entry.proposal_short_id(), entry))
-                .collect();
-
-            // A late parent can leave a child's cached ancestor totals short
-            // of its actual closure. The cache is useful for ordering and the
-            // quick check above, but only this expanded package can authorize
-            // bytes and cycles for the block.
-            let fits = ancestors
-                .values()
-                .try_fold((size, cycles), |(bytes, cycles), entry| {
-                    Some((
-                        bytes.checked_add(entry.size)?,
-                        cycles.checked_add(entry.cycles)?,
-                    ))
-                })
-                .is_some_and(|(bytes, cycles)| bytes <= size_limit && cycles <= cycles_limit);
-            if !fits {
-                if using_modified {
-                    self.modified_entries.remove(&short_id);
-                    self.failed_txs.insert(short_id.clone());
-                }
-                consecutive_failed += 1;
-                if consecutive_failed > MAX_CONSECUTIVE_FAILURES {
-                    break;
-                }
-                continue;
-            }
 
             for (short_id, entry) in &ancestors {
                 let is_new = self.fetched_txs.insert(short_id.clone());
@@ -245,6 +176,67 @@ impl<'a> TxSelector<'a> {
             self.update_modified_entries(&ancestors);
         }
         (self.entries, size, cycles)
+    }
+
+    // Expand an eligible package and check its actual cost before selection mutates state.
+    fn prepare_package(
+        &self,
+        tx_entry: TxEntry,
+        size: usize,
+        cycles: Cycle,
+        size_limit: usize,
+        cycles_limit: Cycle,
+    ) -> Option<LinkedHashMap<ProposalShortId, TxEntry>> {
+        if size.saturating_add(tx_entry.ancestors_size) > size_limit
+            || cycles.saturating_add(tx_entry.ancestors_cycles) > cycles_limit
+        {
+            return None;
+        }
+
+        let ancestors_ids = self.pool_map.calc_ancestors(&tx_entry.proposal_short_id());
+        if ancestors_ids
+            .iter()
+            .any(|id| !self.pool_map.has_proposed(id))
+        {
+            return None;
+        }
+
+        let mut ancestors = ancestors_ids
+            .iter()
+            .filter_map(|id| {
+                if self.fetched_txs.contains(id) {
+                    None
+                } else {
+                    let entry = self.retrieve_entry(id);
+                    debug_assert!(entry.is_some(), "pool should be consistent");
+                    entry
+                }
+            })
+            .cloned()
+            .collect::<Vec<TxEntry>>();
+
+        // Order by cached ancestor counts. Late parents can leave these counts
+        // stale too; this ordering does not establish dependency correctness.
+        ancestors.sort_unstable_by_key(|entry| entry.ancestors_count);
+        ancestors.push(tx_entry);
+        let ancestors: LinkedHashMap<ProposalShortId, TxEntry> = ancestors
+            .into_iter()
+            .map(|entry| (entry.proposal_short_id(), entry))
+            .collect();
+
+        // A late parent can leave cached ancestor totals short of the actual
+        // closure. Use the cache for ordering and the quick check above, but
+        // authorize block capacity only from this expanded, unselected package.
+        let (next_size, next_cycles) =
+            ancestors
+                .values()
+                .try_fold((size, cycles), |(bytes, cycles), entry| {
+                    Some((
+                        bytes.checked_add(entry.size)?,
+                        cycles.checked_add(entry.cycles)?,
+                    ))
+                })?;
+        (next_size <= size_limit && next_cycles <= cycles_limit).then_some(ancestors)
     }
 
     fn retrieve_entry(&self, short_id: &ProposalShortId) -> Option<&TxEntry> {
