@@ -20,6 +20,13 @@ pub struct AddrManager {
 impl AddrManager {
     /// Add an address information to address manager
     pub fn add(&mut self, mut addr_info: AddrInfo) {
+        // `AddrInfo::new` strips transport-only protocols (ws/wss/memory/tls), so an address
+        // made only of them ends up empty. It is undialable and cannot be deserialized back,
+        // which would make the whole persisted address list fail to load.
+        if addr_info.addr.is_empty() {
+            debug!("Ignore empty address");
+            return;
+        }
         if let Some(&id) = self.addr_to_id.get(&addr_info.addr) {
             if let Some(info) = self.id_to_info.get(&id) {
                 let (exist_last_connected_at_ms, random_id_pos) =

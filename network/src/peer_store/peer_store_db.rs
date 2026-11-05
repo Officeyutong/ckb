@@ -8,7 +8,7 @@ use crate::{
         types::{AddrInfo, BannedAddr},
     },
 };
-use ckb_logger::{debug, error};
+use ckb_logger::{debug, error, warn};
 use p2p::multiaddr::Multiaddr;
 use std::path::Path;
 use std::{
@@ -23,9 +23,16 @@ const DEFAULT_ANCHORS_DB: &str = "anchors.db";
 impl AddrManager {
     /// Load address list from disk
     pub fn load<R: Read>(r: R) -> Result<Self, Error> {
-        let addrs: Vec<AddrInfo> = serde_json::from_reader(r).map_err(PeerStoreError::Serde)?;
+        // Decode entries one by one, so a single invalid entry does not discard the whole list
+        let addrs: Vec<serde_json::Value> =
+            serde_json::from_reader(r).map_err(PeerStoreError::Serde)?;
         let mut addr_manager = AddrManager::default();
-        addrs.into_iter().for_each(|addr| addr_manager.add(addr));
+        for addr in addrs {
+            match serde_json::from_value::<AddrInfo>(addr) {
+                Ok(addr) => addr_manager.add(addr),
+                Err(err) => warn!("Skip invalid AddrManager db entry, error: {:?}", err),
+            }
+        }
         Ok(addr_manager)
     }
 
