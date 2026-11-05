@@ -7,6 +7,7 @@ mod orphan;
 mod pending;
 mod proposed;
 mod recent_reject;
+mod relations;
 mod score_key;
 mod transaction_hash;
 mod util;

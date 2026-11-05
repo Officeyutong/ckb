@@ -43,6 +43,23 @@ enum EntryOp {
     Remove,
 }
 
+impl EntryOp {
+    /// A transitive relation contributes each endpoint's own weight exactly
+    /// once, regardless of how many paths connect them.
+    fn apply(self, ancestor: &mut TxEntry, descendant: &mut TxEntry) {
+        match self {
+            Self::Add => {
+                ancestor.add_descendant_weight(descendant);
+                descendant.add_ancestor_weight(ancestor);
+            }
+            Self::Remove => {
+                ancestor.sub_descendant_weight(descendant);
+                descendant.sub_ancestor_weight(ancestor);
+            }
+        }
+    }
+}
+
 #[derive(MultiIndexMap, Clone)]
 pub struct PoolEntry {
     #[multi_index(hashed_unique)]
@@ -57,6 +74,8 @@ pub struct PoolEntry {
     pub inner: TxEntry,
 }
 
+/// The relation graph owns package membership. Cached weights and sort keys
+/// count every reachable entry once, including the entry itself.
 pub struct PoolMap {
     /// The pool entries with different kinds of sort strategies
     pub(crate) entries: MultiIndexPoolEntryMap,
@@ -197,7 +216,8 @@ impl PoolMap {
             })
     }
 
-    /// Inesrt a `TxEntry` into pool_map.
+    /// Insert an entry, deriving its statistics from current membership.
+    /// Rejection leaves entries, links, cell edges and totals unchanged.
     ///
     /// ## Returns
     ///
@@ -211,23 +231,37 @@ impl PoolMap {
         status: Status,
     ) -> Result<(bool, HashSet<TxEntry>), Reject> {
         let tx_short_id = entry.proposal_short_id();
-        let mut evicts = Default::default();
         if self.entries.get_by_id(&tx_short_id).is_some() {
-            return Ok((false, evicts));
+            return Ok((false, Default::default()));
         }
+        self.check_stat_for_add_tx(entry.size, entry.cycles)?;
+        let (links, evicted_ids) = self.prepare_entry_links(&entry)?;
+        self.edges.check_inputs(
+            entry.transaction().input_pts_iter(),
+            &tx_short_id,
+            &evicted_ids,
+        )?;
+
+        // All rejection precedes mutation. Removing planned victims can only
+        // reduce the totals checked above and cannot disconnect a retained path
+        // through them: the eviction set includes every victim's descendants.
+        let evicts = self.remove_entries(evicted_ids);
         trace!("pool_map.add_{:?} {}", status, entry.transaction().hash());
-        evicts = self.check_and_record_ancestors(&mut entry)?;
-        // must be calculated after `check_and_record_ancestors`, since it may evict entries
-        // and update the stats, a snapshot taken before would discard those updates
-        let (total_tx_size, total_tx_cycles) =
-            self.updated_stat_for_add_tx(entry.size, entry.cycles)?;
-        self.record_entry_edges(&entry)?;
+        entry.reset_statistic_state();
+        self.update_relations(&mut entry, &links, EntryOp::Add);
+        self.record_entry_edges(&entry);
+        for parent in &links.parents {
+            self.links.add_child(parent, tx_short_id.clone());
+        }
+        for child in &links.children {
+            self.links.add_parent(child, tx_short_id.clone());
+        }
+        self.links.add_link(tx_short_id, links);
         self.insert_entry(&entry, status);
-        self.record_entry_descendants(&entry);
         self.track_entry_statics(None, Some(status));
-        self.total_tx_size = total_tx_size;
-        self.total_tx_cycles = total_tx_cycles;
-        Ok((true, evicts))
+        self.total_tx_size += entry.size;
+        self.total_tx_cycles += entry.cycles;
+        Ok((true, evicts.into_iter().collect()))
     }
 
     /// Change the status of the entry, only used for `gap_rtx` and `proposed_rtx`
@@ -249,10 +283,12 @@ impl PoolMap {
                 entry.inner.transaction().hash(),
                 entry.status
             );
-            self.update_ancestors_index_key(&entry.inner, EntryOp::Remove);
-            self.update_descendants_index_key(&entry.inner, EntryOp::Remove);
+            // Keep the removed entry's original ancestry for callers that
+            // restore a batch in dependency order.
+            if let Some(links) = self.remove_entry_links(id) {
+                self.update_relations(&mut entry.inner.clone(), &links, EntryOp::Remove);
+            }
             self.remove_entry_edges(&entry.inner);
-            self.remove_entry_links(id);
             self.track_entry_statics(Some(entry.status), None);
             self.update_stat_for_remove_tx(entry.inner.size, entry.inner.cycles);
             entry.inner
@@ -260,17 +296,73 @@ impl PoolMap {
     }
 
     pub(crate) fn remove_entry_and_descendants(&mut self, id: &ProposalShortId) -> Vec<TxEntry> {
-        let mut removed_ids = vec![id.to_owned()];
-        removed_ids.extend(self.calc_descendants(id));
+        let Some(root) = self.get(id).cloned() else {
+            return Vec::new();
+        };
+        let mut removed_ids = self.calc_descendants(id);
+        removed_ids.insert(id.clone());
+        let ancestors = self.calc_ancestors(id);
 
-        // update links state for remove, so that we won't update_descendants_index_key in remove_entry
-        for id in &removed_ids {
-            self.remove_entry_links(id);
+        // Every ancestor of the root loses the entire package. Other ancestors
+        // can reach only part of it, through a retained parent of a removed tx.
+        let other_parents = removed_ids
+            .iter()
+            .filter_map(|id| self.links.get_parents(id))
+            .flatten()
+            .filter(|id| !removed_ids.contains(*id) && !ancestors.contains(*id))
+            .cloned()
+            .collect();
+        let other_ancestors = self
+            .links
+            .calc_relation_ids(other_parents, Relation::Parents);
+        for id in other_ancestors.difference(&ancestors) {
+            let descendants = self.calc_descendants(id);
+            let mut ancestor = self.get_by_id_checked(id).inner.clone();
+            for removed in descendants.intersection(&removed_ids) {
+                ancestor.sub_descendant_weight(&self.get_by_id_checked(removed).inner);
+            }
+            self.entries.modify_by_id(id, |stored| {
+                stored.evict_key = ancestor.as_evict_key();
+                stored.inner = ancestor;
+            });
+        }
+        for id in ancestors {
+            self.entries.modify_by_id(&id, |ancestor| {
+                ancestor.inner.sub_descendant_package(&root);
+                ancestor.evict_key = ancestor.inner.as_evict_key();
+            });
         }
 
+        // The removal set is descendant-closed: no retained entry loses an
+        // ancestor. Preserve each removed entry's original statistics.
         removed_ids
+            .into_iter()
+            .filter_map(|id| {
+                let entry = self.entries.remove_by_id(&id)?;
+                self.remove_entry_links(&id);
+                self.remove_entry_edges(&entry.inner);
+                self.track_entry_statics(Some(entry.status), None);
+                self.update_stat_for_remove_tx(entry.inner.size, entry.inner.cycles);
+                Some(entry.inner)
+            })
+            .collect()
+    }
+
+    /// Remove a descendant-closed set, starting at its roots so shared
+    /// descendants and their statistics are removed only once.
+    fn remove_entries(&mut self, ids: HashSet<ProposalShortId>) -> Vec<TxEntry> {
+        let roots: Vec<_> = ids
             .iter()
-            .filter_map(|id| self.remove_entry(id))
+            .filter(|id| {
+                self.links
+                    .get_parents(id)
+                    .is_none_or(|parents| parents.is_disjoint(&ids))
+            })
+            .cloned()
+            .collect();
+        roots
+            .iter()
+            .flat_map(|id| self.remove_entry_and_descendants(id))
             .collect()
     }
 
@@ -440,232 +532,184 @@ impl PoolMap {
             .filter_map(move |entry| statuses.contains(&entry.status).then_some(&entry.inner))
     }
 
-    fn remove_entry_links(&mut self, id: &ProposalShortId) {
-        if let Some(parents) = self.links.get_parents(id).cloned() {
-            for parent in parents {
-                self.links.remove_child(&parent, id);
-            }
+    fn remove_entry_links(&mut self, id: &ProposalShortId) -> Option<TxLinks> {
+        let links = self.links.remove(id)?;
+        for parent in &links.parents {
+            self.links.remove_child(parent, id);
         }
-        if let Some(children) = self.links.get_children(id).cloned() {
-            for child in children {
-                self.links.remove_parent(&child, id);
-            }
+        for child in &links.children {
+            self.links.remove_parent(child, id);
         }
-        self.links.remove(id);
+        Some(links)
     }
 
-    fn update_ancestors_index_key(&mut self, child: &TxEntry, op: EntryOp) {
-        let ancestors: HashSet<ProposalShortId> =
-            self.links.calc_ancestors(&child.proposal_short_id());
-        for anc_id in &ancestors {
-            // update parent score
-            self.entries.modify_by_id(anc_id, |e| {
-                match op {
-                    EntryOp::Remove => e.inner.sub_descendant_weight(child),
-                    EntryOp::Add => e.inner.add_descendant_weight(child),
+    /// Reconcile a vertex insertion/removal against the graph *without* that
+    /// vertex. Only ancestor/descendant pairs with no alternative path change.
+    /// Update each retained entry's index once, after its complete delta.
+    fn update_relations(&mut self, entry: &mut TxEntry, links: &TxLinks, op: EntryOp) {
+        let ancestors = self
+            .links
+            .calc_relation_ids(links.parents.clone(), Relation::Parents);
+        let descendants = self
+            .links
+            .calc_relation_ids(links.children.clone(), Relation::Children);
+        let mut ancestors: Vec<_> = ancestors
+            .into_iter()
+            .map(|id| {
+                let entry = self.get_by_id_checked(&id).inner.clone();
+                (id, entry)
+            })
+            .collect();
+        for (_, ancestor) in &mut ancestors {
+            op.apply(ancestor, entry);
+        }
+        for id in descendants {
+            // Reaching every direct parent proves that every ancestor already
+            // has an alternative path. Stop before retraversing their shared
+            // ancestry; otherwise retain the full alternative ancestor set.
+            let mut remaining_parents = links.parents.clone();
+            let mut unchanged = self.links.get_parents(&id).cloned().unwrap_or_default();
+            let mut pending: Vec<_> = unchanged.iter().cloned().collect();
+            while !remaining_parents.is_empty() {
+                let Some(parent) = pending.pop() else {
+                    break;
                 };
-                e.evict_key = e.inner.as_evict_key();
+                remaining_parents.remove(&parent);
+                if let Some(parents) = self.links.get_parents(&parent) {
+                    for parent in parents {
+                        if unchanged.insert(parent.clone()) {
+                            pending.push(parent.clone());
+                        }
+                    }
+                }
+            }
+            self.entries.modify_by_id(&id, |descendant| {
+                op.apply(entry, &mut descendant.inner);
+                if !remaining_parents.is_empty() {
+                    for (ancestor_id, ancestor) in &mut ancestors {
+                        if !unchanged.contains(ancestor_id) {
+                            op.apply(ancestor, &mut descendant.inner);
+                        }
+                    }
+                }
+                descendant.score = descendant.inner.as_score_key();
+            });
+        }
+        for (id, ancestor) in ancestors {
+            self.entries.modify_by_id(&id, |stored| {
+                stored.evict_key = ancestor.as_evict_key();
+                stored.inner = ancestor;
             });
         }
     }
 
-    fn update_descendants_index_key(&mut self, parent: &TxEntry, op: EntryOp) {
-        let descendants: HashSet<ProposalShortId> =
-            self.links.calc_descendants(&parent.proposal_short_id());
-        for desc_id in &descendants {
-            // update child score
-            self.entries.modify_by_id(desc_id, |e| {
-                match op {
-                    EntryOp::Remove => e.inner.sub_ancestor_weight(parent),
-                    EntryOp::Add => e.inner.add_ancestor_weight(parent),
-                };
-                e.score = e.inner.as_score_key();
-            });
+    fn record_entry_edges(&mut self, entry: &TxEntry) {
+        let id = entry.proposal_short_id();
+        // Input uniqueness is checked before any membership mutation.
+        for input in entry.transaction().input_pts_iter() {
+            self.edges.inputs.insert(input, id.clone());
         }
-    }
-
-    fn record_entry_edges(&mut self, entry: &TxEntry) -> Result<(), Reject> {
-        let tx_short_id: ProposalShortId = entry.proposal_short_id();
+        for dep in entry.related_dep_out_points() {
+            self.edges.insert_deps(dep.clone(), id.clone());
+        }
         let header_deps = entry.transaction().header_deps();
-        let related_dep_out_points: Vec<_> = entry.related_dep_out_points().cloned().collect();
-        let inputs = entry.transaction().input_pts_iter();
-
-        // if input reference a in-pool output, connect it
-        // otherwise, record input for conflict check
-        for i in inputs {
-            self.edges.insert_input(i.to_owned(), tx_short_id.clone())?;
-        }
-
-        // record dep-txid
-        for d in related_dep_out_points {
-            self.edges.insert_deps(d.to_owned(), tx_short_id.clone());
-        }
-        // record header_deps
         if !header_deps.is_empty() {
             self.edges
                 .header_deps
-                .insert(tx_short_id, header_deps.into_iter().collect());
+                .insert(id, header_deps.into_iter().collect());
         }
-        Ok(())
     }
 
-    fn record_entry_descendants(&mut self, entry: &TxEntry) {
-        let tx_short_id: ProposalShortId = entry.proposal_short_id();
-        let outputs = entry.transaction().output_pts();
-        let mut children = HashSet::new();
-
-        // collect children
-        for o in outputs {
-            if let Some(ids) = self.edges.get_deps_ref(&o).cloned() {
-                children.extend(ids);
-            }
-            if let Some(id) = self.edges.get_input_ref(&o).cloned() {
-                children.insert(id);
-            }
-        }
-        // update children
-        if !children.is_empty() {
-            for child in &children {
-                self.links.add_parent(child, tx_short_id.clone());
-            }
-            if let Some(links) = self.links.inner.get_mut(&tx_short_id) {
-                links.children.extend(children);
-            }
-            self.update_descendants_index_key(entry, EntryOp::Add);
-        }
-        // update ancestor's index key for adding new entry
-        self.update_ancestors_index_key(entry, EntryOp::Add);
-    }
-
-    // return (ancestors, parents, cell_ref_parents)
-    // `cell_ref_parents` may be invalidate when the tx consuming the cell is submitted
-    fn get_tx_ancenstors(
+    /// Prepare direct links and the complete eviction set without mutating the
+    /// pool. The same resolved dependencies define both links and cell edges.
+    fn prepare_entry_links(
         &self,
-        entry: &TransactionView,
-    ) -> (
-        HashSet<ProposalShortId>,
-        HashSet<ProposalShortId>,
-        HashSet<ProposalShortId>,
-    ) {
-        let mut parents: HashSet<ProposalShortId> =
-            HashSet::with_capacity(entry.inputs().len() + entry.cell_deps().len());
-        let mut cell_ref_parents: HashSet<ProposalShortId> = Default::default();
-
-        for input in entry.inputs() {
-            let input_pt = input.previous_output();
-            if let Some(deps) = self.edges.deps.get(&input_pt) {
-                cell_ref_parents.extend(deps.iter().cloned());
-                parents.extend(deps.iter().cloned());
-            }
-
-            if let Some(parent) = self.get_by_tx_hash(&input_pt.tx_hash()) {
-                parents.insert(parent.id.clone());
-            }
-        }
-        for cell_dep in entry.cell_deps() {
-            let dep_pt = cell_dep.out_point();
-            if let Some(parent) = self.get_by_tx_hash(&dep_pt.tx_hash()) {
-                parents.insert(parent.id.clone());
-            }
-        }
-
-        let ancestors = self
-            .links
-            .calc_relation_ids(parents.clone(), Relation::Parents);
-
-        (ancestors, parents, cell_ref_parents)
-    }
-
-    fn _record_ancestors(
-        &mut self,
-        entry: &mut TxEntry,
-        ancestors: HashSet<ProposalShortId>,
-        parents: HashSet<ProposalShortId>,
-    ) {
-        // update parents references
-        for ancestor_id in &ancestors {
-            let ancestor = self.get_by_id_checked(ancestor_id);
-            entry.add_ancestor_weight(&ancestor.inner);
-        }
-
-        let short_id = entry.proposal_short_id();
-
-        for parent in &parents {
-            self.links.add_child(parent, short_id.clone());
-        }
-        self.links.add_link(
-            short_id,
-            TxLinks {
-                parents,
-                children: Default::default(),
-            },
-        );
-    }
-
-    /// Check ancestors and record for entry
-    // FIXME: In the scenario that a transaction passed all RBF rules, and then removed the conflicted
-    // transaction in txpool, then failed with max ancestor limits, we now need to rollback the removing.
-    // this is not an issue currently, because RBF have a rule that not allow any unknown inputs except
-    // the conflicted inputs, so the new transaction can not be in a long transaction chain.
-    // but it's still safer to report an error before any writing kind of operation.
-    fn check_and_record_ancestors(
-        &mut self,
-        entry: &mut TxEntry,
-    ) -> Result<HashSet<TxEntry>, Reject> {
+        entry: &TxEntry,
+    ) -> Result<(TxLinks, HashSet<ProposalShortId>), Reject> {
         let tx = entry.transaction();
-        let (ancestors, mut parents, cell_ref_parents) = self.get_tx_ancenstors(tx);
-
-        let mut ancestors_count = ancestors.len() + 1;
-        let mut evicted = Default::default();
-
-        if ancestors_count <= self.max_ancestors_count {
-            self._record_ancestors(entry, ancestors, parents);
-            return Ok(evicted);
-        }
-
-        if ancestors_count.saturating_sub(cell_ref_parents.len()) > self.max_ancestors_count {
-            return Err(Reject::ExceededMaximumAncestorsCount);
-        }
-
-        // if ancestors count exceed limitation,
-        // try to evict some conflicted transactions due to ref cells
-
-        // sort them to find out the transactions with lowest fees
-        let evict_candidates: Vec<ProposalShortId> = self
-            .entries
-            .iter_by_evict_key()
-            .filter(move |entry| cell_ref_parents.contains(&entry.id))
-            .map(|x| x.id.clone())
-            .collect();
-
-        let mut iter = evict_candidates.iter();
-        while ancestors_count > self.max_ancestors_count {
-            let Some(next_id) = iter.next() else {
-                break;
-            };
-
-            let removed = self.remove_entry_and_descendants(next_id);
-            for removed_id in removed.iter().map(|entry| entry.proposal_short_id()) {
-                parents.remove(&removed_id);
+        let mut parents = HashSet::new();
+        let mut cell_ref_parents = HashSet::new();
+        for input in tx.input_pts_iter() {
+            if let Some(readers) = self.edges.get_deps_ref(&input) {
+                cell_ref_parents.extend(readers.iter().cloned());
+                parents.extend(readers.iter().cloned());
             }
-            ancestors_count = self
-                .links
-                .calc_relation_ids(parents.clone(), Relation::Parents)
-                .len()
-                + 1;
-            evicted.extend(removed);
         }
-
-        // some txs in `parents` are removed, now `ancestors` need to re-caculate,
-        let ancestors = self
+        for point in tx
+            .input_pts_iter()
+            .chain(entry.related_dep_out_points().cloned())
+        {
+            if let Some(parent) = self.get_by_tx_hash(&point.tx_hash()) {
+                parents.insert(parent.id.clone());
+            }
+        }
+        let mut ancestors = self
             .links
             .calc_relation_ids(parents.clone(), Relation::Parents);
+        let mut evicted = HashSet::new();
+        if ancestors.len() + 1 > self.max_ancestors_count {
+            if (ancestors.len() + 1).saturating_sub(cell_ref_parents.len())
+                > self.max_ancestors_count
+            {
+                return Err(Reject::ExceededMaximumAncestorsCount);
+            }
+            // Preserve the existing lowest-fee reader eviction policy, but
+            // finish validation before removing any reader or its descendants.
+            for candidate in self.entries.iter_by_evict_key() {
+                if !cell_ref_parents.contains(&candidate.id) {
+                    continue;
+                }
+                evicted.insert(candidate.id.clone());
+                evicted.extend(self.calc_descendants(&candidate.id));
+                parents.retain(|id| !evicted.contains(id));
+                ancestors = self
+                    .links
+                    .calc_relation_ids(parents.clone(), Relation::Parents);
+                if ancestors.len() < self.max_ancestors_count {
+                    break;
+                }
+            }
+            if ancestors.len() >= self.max_ancestors_count {
+                return Err(Reject::ExceededMaximumAncestorsCount);
+            }
+        }
 
-        // we can assume the number now is less than `max_ancestors_count`
-        assert!(ancestors.len() < self.max_ancestors_count);
-
-        self._record_ancestors(entry, ancestors, parents);
-        Ok(evicted)
+        let mut children = HashSet::new();
+        for output in tx.output_pts() {
+            if let Some(readers) = self.edges.get_deps_ref(&output) {
+                children.extend(readers.iter().cloned());
+            }
+            if let Some(spender) = self.edges.get_input_ref(&output) {
+                children.insert(spender.clone());
+            }
+        }
+        for dep in entry.related_dep_out_points() {
+            if let Some(spender) = self.edges.get_input_ref(dep) {
+                children.insert(spender.clone());
+            }
+        }
+        children.retain(|id| !evicted.contains(id));
+        let descendants = self
+            .links
+            .calc_relation_ids(children.clone(), Relation::Children);
+        if !ancestors.is_disjoint(&descendants) {
+            return Err(Reject::Invalidated("cyclic tx-pool dependencies".into()));
+        }
+        for id in descendants {
+            let descendant = self.get_by_id_checked(&id);
+            // With no shared ancestors this is the largest possible count.
+            // Walk the existing closure only when overlap could decide refusal.
+            if descendant
+                .inner
+                .ancestors_count
+                .saturating_add(ancestors.len() + 1)
+                > self.max_ancestors_count
+                && self.calc_ancestors(&id).union(&ancestors).count() + 2 > self.max_ancestors_count
+            {
+                return Err(Reject::ExceededMaximumAncestorsCount);
+            }
+        }
+        Ok((TxLinks { parents, children }, evicted))
     }
 
     fn remove_entry_edges(&mut self, entry: &TxEntry) {
@@ -736,25 +780,21 @@ impl PoolMap {
         )
     }
 
-    /// Calculate size and cycles statistics for adding a tx.
-    fn updated_stat_for_add_tx(
-        &self,
-        tx_size: usize,
-        cycles: Cycle,
-    ) -> Result<(usize, Cycle), Reject> {
-        let total_tx_size = self.total_tx_size.checked_add(tx_size).ok_or_else(|| {
+    /// Check size and cycle totals before any membership mutation.
+    fn check_stat_for_add_tx(&self, tx_size: usize, cycles: Cycle) -> Result<(), Reject> {
+        self.total_tx_size.checked_add(tx_size).ok_or_else(|| {
             Reject::Full(format!(
                 "tx-pool total_tx_size {} overflows by add {}",
                 self.total_tx_size, tx_size
             ))
         })?;
-        let total_tx_cycles = self.total_tx_cycles.checked_add(cycles).ok_or_else(|| {
+        self.total_tx_cycles.checked_add(cycles).ok_or_else(|| {
             Reject::Full(format!(
                 "tx-pool total_tx_cycles {} overflows by add {}",
                 self.total_tx_cycles, cycles
             ))
         })?;
-        Ok((total_tx_size, total_tx_cycles))
+        Ok(())
     }
 
     /// Update size and cycles statistics for remove tx

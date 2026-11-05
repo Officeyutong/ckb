@@ -43,9 +43,12 @@ fn late_parent_pool(grandparent_fee: u64) -> (PoolMap, [TxEntry; 3]) {
     }
     let child = pool.get_proposed(&child_id).unwrap();
     assert_eq!(pool.calc_ancestors(&child_id).len(), 2);
-    assert_eq!(child.ancestors_size, entries[1].size + entries[2].size);
-    assert_eq!(child.ancestors_cycles, 200);
-    assert_eq!(child.ancestors_count, 2);
+    assert_eq!(
+        child.ancestors_size,
+        entries.iter().map(|entry| entry.size).sum::<usize>()
+    );
+    assert_eq!(child.ancestors_cycles, 300);
+    assert_eq!(child.ancestors_count, 3);
     (pool, entries)
 }
 
@@ -129,8 +132,8 @@ fn late_parent_package_uses_the_remaining_budget() {
 #[test]
 fn modified_package_rejection_preserves_selected_prefix() {
     let (pool, entries) = late_parent_pool(2_000_000);
-    // The grandparent wins first. Subtracting it makes the child's already
-    // incomplete cache smaller still, but its remaining parent must fit too.
+    // The grandparent wins first. Its selected cost must be subtracted once;
+    // the remaining package still contains both the parent and child.
     assert_selection(&pool, entries[0].size + entries[1].size, 200, &entries[..2]);
 }
 

@@ -141,6 +141,22 @@ impl TxEntry {
         );
     }
 
+    /// Remove the weight of a descendant and its entire descendant package.
+    pub(crate) fn sub_descendant_package(&mut self, entry: &TxEntry) {
+        self.descendants_count = self
+            .descendants_count
+            .saturating_sub(entry.descendants_count);
+        self.descendants_size = self.descendants_size.saturating_sub(entry.descendants_size);
+        self.descendants_cycles = self
+            .descendants_cycles
+            .saturating_sub(entry.descendants_cycles);
+        self.descendants_fee = Capacity::shannons(
+            self.descendants_fee
+                .as_u64()
+                .saturating_sub(entry.descendants_fee.as_u64()),
+        );
+    }
+
     /// Update ancestor state for add an entry
     pub fn add_ancestor_weight(&mut self, entry: &TxEntry) {
         self.ancestors_count = self.ancestors_count.saturating_add(1);

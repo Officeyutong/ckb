@@ -178,7 +178,7 @@ impl<'a> TxSelector<'a> {
         (self.entries, size, cycles)
     }
 
-    // Expand an eligible package and check its actual cost before selection mutates state.
+    // Check the remaining package cost and proposal eligibility before selection mutates state.
     fn prepare_package(
         &self,
         tx_entry: TxEntry,
@@ -215,28 +215,16 @@ impl<'a> TxSelector<'a> {
             .cloned()
             .collect::<Vec<TxEntry>>();
 
-        // Order by cached ancestor counts. Late parents can leave these counts
-        // stale too; this ordering does not establish dependency correctness.
+        // Every remaining ancestor has a strictly smaller ancestor set than
+        // its descendants. Pool mutations maintain these counts on both sides.
         ancestors.sort_unstable_by_key(|entry| entry.ancestors_count);
         ancestors.push(tx_entry);
-        let ancestors: LinkedHashMap<ProposalShortId, TxEntry> = ancestors
-            .into_iter()
-            .map(|entry| (entry.proposal_short_id(), entry))
-            .collect();
-
-        // A late parent can leave cached ancestor totals short of the actual
-        // closure. Use the cache for ordering and the quick check above, but
-        // authorize block capacity only from this expanded, unselected package.
-        let (next_size, next_cycles) =
+        Some(
             ancestors
-                .values()
-                .try_fold((size, cycles), |(bytes, cycles), entry| {
-                    Some((
-                        bytes.checked_add(entry.size)?,
-                        cycles.checked_add(entry.cycles)?,
-                    ))
-                })?;
-        (next_size <= size_limit && next_cycles <= cycles_limit).then_some(ancestors)
+                .into_iter()
+                .map(|entry| (entry.proposal_short_id(), entry))
+                .collect(),
+        )
     }
 
     fn retrieve_entry(&self, short_id: &ProposalShortId) -> Option<&TxEntry> {
@@ -264,8 +252,6 @@ impl<'a> TxSelector<'a> {
                 .iter()
                 .filter(|id| !already_added.contains_key(id) && self.pool_map.has_proposed(id))
             {
-                // Note: since https://github.com/nervosnetwork/ckb/pull/3706
-                // calc_descendants() may not consistent
                 if let Some(mut desc) = self
                     .modified_entries
                     .remove(desc_id)
