@@ -46,7 +46,8 @@ pub(crate) async fn verify_rtx(
                 data_loader,
                 tx_env,
                 cache_entry.map(|entry| entry.cycles),
-            ),
+            )
+            .with_validation_mode(ckb_script::ValidationMode::Strict),
         )
     };
 

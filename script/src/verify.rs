@@ -19,7 +19,9 @@ use ckb_types::{
     core::{Cycle, ScriptHashType, cell::ResolvedTransaction},
     packed::{Byte32, Script},
 };
-use ckb_vm::{DefaultMachineRunner, Error as VMInternalError};
+#[cfg(not(target_family = "wasm"))]
+use ckb_vm::machine::Pause as VMPause;
+use ckb_vm::{DefaultMachineRunner, Error as VMInternalError, ValidationMode};
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -40,6 +42,7 @@ pub struct TransactionScriptsVerifier<
     tx_data: Arc<TxData<DL>>,
     syscall_generator: SyscallGenerator<DL, V, <M as DefaultMachineRunner>::Inner>,
     syscall_context: V,
+    validation_mode: ValidationMode,
 }
 
 impl<DL> TransactionScriptsVerifier<DL>
@@ -113,7 +116,14 @@ where
             tx_data,
             syscall_generator,
             syscall_context,
+            validation_mode: ValidationMode::Consensus,
         }
+    }
+
+    /// Sets the validation mode inherited by all VMs created by this verifier's schedulers.
+    pub fn with_validation_mode(mut self, validation_mode: ValidationMode) -> Self {
+        self.validation_mode = validation_mode;
+        self
     }
 
     //////////////////////////////////////////////////////////////////
@@ -236,7 +246,8 @@ where
             sg_data,
             self.syscall_generator,
             self.syscall_context.clone(),
-        ))
+        )
+        .with_validation_mode(self.validation_mode))
     }
 
     /// Runs a single program, then returns the exit code together with the entire

@@ -13,7 +13,7 @@ use ckb_traits::{CellDataProvider, ExtensionProvider, HeaderProvider};
 use ckb_types::core::Cycle;
 use ckb_vm::snapshot2::Snapshot2Context;
 use ckb_vm::{
-    Error, FlattenedArgsReader, Register,
+    Error, FlattenedArgsReader, Register, ValidationMode,
     bytes::Bytes,
     cost_model::estimate_cycles,
     elf::parse_elf,
@@ -55,6 +55,7 @@ where
     syscall_generator: SyscallGenerator<DL, V, M::Inner>,
     /// Syscall generator context
     syscall_context: V,
+    validation_mode: ValidationMode,
 
     /// Total cycles. When a scheduler executes, there are 3 variables
     /// that might all contain charged cycles: +total_cycles+,
@@ -136,6 +137,7 @@ where
             sg_data,
             syscall_generator,
             syscall_context,
+            validation_mode: ValidationMode::Consensus,
             total_cycles: Arc::new(AtomicU64::new(0)),
             iteration_cycles: 0,
             next_vm_id: FIRST_VM_ID,
@@ -149,6 +151,12 @@ where
             terminated_vms: BTreeMap::default(),
             root_vm_args: Vec::new(),
         }
+    }
+
+    /// Sets the validation mode for VMs subsequently created by this scheduler.
+    pub fn with_validation_mode(mut self, validation_mode: ValidationMode) -> Self {
+        self.validation_mode = validation_mode;
+        self
     }
 
     /// Return total cycles.
@@ -1025,6 +1033,7 @@ where
         };
 
         let machine_builder = DefaultMachineBuilder::new(core_machine)
+            .validation_mode(self.validation_mode)
             .instruction_cycle_func(Box::new(estimate_cycles));
         let machine_builder =
             (self.syscall_generator)(id, &self.sg_data, &vm_context, &self.syscall_context)
