@@ -1343,7 +1343,9 @@ pub struct SyncState {
 
     // The priority is ordering by timestamp (reversed), means do not ask the tx before this timestamp (timeout).
     unknown_tx_hashes: Mutex<KeyedPriorityQueue<Byte32, UnknownTxHashPriority>>,
-    // Other announcers of received txs, used to refetch a tx whose body was discarded as malformed.
+    // Remote tx bodies under verification in the tx-pool, with the other peers that announced them.
+    // Used to refetch a tx whose body was discarded as malformed. Announcements that arrive while
+    // the body is verified are recorded too, because `tx_filter` already ignores them.
     tx_fallback_peers: Mutex<LruCache<Byte32, Vec<PeerIndex>>>,
 
     /* Status relevant to peers */
@@ -1481,10 +1483,26 @@ impl SyncState {
         self.tx_filter.lock().remove(hash);
     }
 
+    /// Start tracking a remote tx body under verification, `peers` are its other announcers.
     pub fn add_tx_fallback_peers(&self, hash: Byte32, peers: Vec<PeerIndex>) {
-        if !peers.is_empty() {
-            self.tx_fallback_peers.lock().put(hash, peers);
+        self.tx_fallback_peers.lock().put(hash, peers);
+    }
+
+    /// Record `peer` as an announcer of each tx in `hashes` whose body is under verification.
+    pub fn add_tx_fallback_peer(&self, hashes: impl Iterator<Item = Byte32>, peer: PeerIndex) {
+        let mut tx_fallback_peers = self.tx_fallback_peers.lock();
+        for hash in hashes {
+            if let Some(peers) = tx_fallback_peers.get_mut(&hash)
+                && !peers.contains(&peer)
+            {
+                peers.push(peer);
+            }
         }
+    }
+
+    /// Stop tracking a tx whose verification finished without discarding its body.
+    pub fn remove_tx_fallback_peers(&self, hash: &Byte32) {
+        self.tx_fallback_peers.lock().pop(hash);
     }
 
     /// Forget a tx whose body was discarded as malformed and ask the other announcers for it again.

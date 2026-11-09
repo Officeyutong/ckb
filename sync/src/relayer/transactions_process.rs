@@ -65,7 +65,8 @@ impl<'a> TransactionsProcess<'a> {
         }
 
         // Repeated bodies of one hash push the same entry more than once, which
-        // `add_tx_fallback_peers` overwrites with the same value
+        // `add_tx_fallback_peers` overwrites with the same value. An entry is added even
+        // without other announcers, so that later announcements can be recorded.
         let mut fallback_peers = Vec::new();
         let txs: Vec<(TransactionView, Cycle)> = {
             // ignore the tx if it's already known or it has never been requested before

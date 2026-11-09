@@ -35,19 +35,20 @@ impl<'a> TransactionHashesProcess<'a> {
             }
         }
 
-        let tx_hashes: Vec<_> = {
+        let (known_tx_hashes, tx_hashes): (Vec<_>, Vec<_>) = {
             let mut tx_filter = state.tx_filter();
             tx_filter.remove_expired();
             self.message
                 .tx_hashes()
                 .iter()
                 .map(|x| x.to_entity())
-                .filter(|tx_hash| !tx_filter.contains(tx_hash))
                 .collect::<std::collections::HashSet<_>>()
                 .into_iter()
-                .collect()
+                .partition(|tx_hash| tx_filter.contains(tx_hash))
         };
 
+        // A known tx may still be under verification, keep this peer in case its body is discarded
+        state.add_tx_fallback_peer(known_tx_hashes.into_iter(), self.peer);
         state.add_ask_for_txs(self.peer, tx_hashes)
     }
 }

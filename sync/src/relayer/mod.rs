@@ -664,6 +664,7 @@ impl Relayer {
                         original_peer,
                         tx_hash,
                     } => {
+                        self.shared.state().remove_tx_fallback_peers(&tx_hash);
                         for target in &connected_peers {
                             match original_peer {
                                 Some(peer) => {
@@ -687,6 +688,7 @@ impl Relayer {
                         }
                     }
                     TxVerificationResult::Reject { tx_hash } => {
+                        self.shared.state().remove_tx_fallback_peers(&tx_hash);
                         self.shared.state().remove_from_known_txs(&tx_hash);
                     }
                     TxVerificationResult::Refetch { tx_hash } => {
