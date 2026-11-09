@@ -846,10 +846,12 @@ impl TxPoolService {
 
         let fetched_cache = self.fetch_txs_verify_cache(retain.iter()).await;
 
-        // If there are any transactions requires re-process, return them.
+        // Transactions the reorg detached and did not attach again are re-processed below.
         //
-        // At present, there is only one situation:
-        // - If the hardfork was happened, then re-process all transactions.
+        // Re-processing every transaction when a hardfork activates used to be the only other
+        // case. That path was removed together with the hardfork cache invalidation machinery;
+        // see `ckb_verification::cache::TxVerificationCache` for the reasoning and for the
+        // residual risk that a future semantic-changing fork has to handle.
         {
             // This closure is used to limit the lifetime of mutable tx_pool.
             let mut tx_pool = self.tx_pool.write().await;

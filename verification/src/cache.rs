@@ -12,6 +12,10 @@ use std::sync::Arc;
 ///
 /// The private field and the absence of a `Byte32` conversion ensure callers can only create a
 /// key from a [`TransactionView`].
+///
+/// The key carries no epoch, script version or hardfork context on purpose; see
+/// [`TxVerificationCache`] for the reasoning and for the residual risk that a future
+/// semantic-changing hardfork has to account for.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct VerifyCacheKey(Byte32);
 
@@ -22,6 +26,25 @@ impl From<&TransactionView> for VerifyCacheKey {
 }
 
 /// TX verification lru cache
+///
+/// # The cache is not bound to the VM or hardfork context, and that is deliberate
+///
+/// Entries are keyed by the witness hash only (see [`VerifyCacheKey`]) and store nothing but a
+/// script cycle count, so a hit replays that count without executing the script, even when the
+/// current epoch would select a different VM version for the same transaction.
+///
+/// This is a reviewed decision, not an oversight. A hardfork that changes script results is
+/// scheduled at a known epoch, so only a node that stays up across the activation can carry an
+/// entry from before it. CKB2021 and CKB2023 shipped together with explicit invalidation: the
+/// cache was reset when a hardfork feature that may change script results became enabled. After
+/// both forks activated, historical chain data was reviewed and confirmed to be unaffected by
+/// that shortcut, and the transition machinery was removed as cleanup.
+///
+/// The residual exposure is recorded here on purpose: a node that stays up across a *future*
+/// fork which changes script results can serve a pre-fork entry for a transaction that the new
+/// VM rejects, while a node without that entry re-executes the script and rejects the block
+/// that contains it. Any such fork must bring the invalidation back as part of its rollout, and
+/// must not assume that the cache is cold at the activation epoch.
 pub type TxVerificationCache = lru::LruCache<VerifyCacheKey, CachedScriptCycles>;
 
 /// Verification cache entries fetched for a batch of transactions.
@@ -53,6 +76,9 @@ pub fn init_cache() -> TxVerificationCache {
 }
 
 /// Cached result of successful transaction script verification.
+///
+/// It records the cycles only; no VM version, epoch or hardfork marker is stored alongside it.
+/// See [`TxVerificationCache`] for why that is intentional.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CachedScriptCycles {
     /// Cached transaction script cycles.
