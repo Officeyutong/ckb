@@ -95,20 +95,14 @@ impl<'a> HeadersProcess<'a> {
         debug!("HeadersProcess begins");
         let shared: &SyncShared = self.synchronizer.shared();
         let consensus = shared.consensus();
-        let headers = self
-            .message
-            .headers()
-            .to_entity()
-            .into_iter()
-            .map(packed::Header::into_view)
-            .collect::<Vec<_>>();
-
-        if headers.len() > MAX_HEADERS_LEN {
+        let headers_reader = self.message.headers();
+        // Check the count on the reader, so an oversized message is rejected before any conversion
+        if headers_reader.len() > MAX_HEADERS_LEN {
             warn!("HeadersProcess is oversized");
             return StatusCode::HeadersIsInvalid.with_context("oversize");
         }
 
-        if headers.is_empty() {
+        if headers_reader.is_empty() {
             // Empty means that the other peer's tip may be consistent with our own best known,
             // but empty cannot 100% confirm this, so it does not set the other peer's best header
             // to the shared best known.
@@ -123,6 +117,12 @@ impl<'a> HeadersProcess<'a> {
             }
             return Status::ok();
         }
+
+        let headers = headers_reader
+            .to_entity()
+            .into_iter()
+            .map(packed::Header::into_view)
+            .collect::<Vec<_>>();
 
         if !self.is_continuous(&headers) {
             warn!("HeadersProcess is not continuous");
@@ -180,10 +180,11 @@ impl<'a> HeadersProcess<'a> {
 
         self.debug();
 
-        if headers.len() == MAX_HEADERS_LEN {
-            let start = headers.last().expect("empty checked").into();
+        if headers.len() == MAX_HEADERS_LEN
+            && let Some(start) = headers.last()
+        {
             self.active_chain
-                .send_getheaders_to_peer(self.nc, self.peer, start);
+                .send_getheaders_to_peer(self.nc, self.peer, start.into());
         } else if let Some(mut state) = self.synchronizer.peers().state.get_mut(&self.peer) {
             self.synchronizer
                 .shared()
@@ -293,22 +294,28 @@ impl<'a, DL: HeaderFieldsProvider> HeaderAcceptor<'a, DL> {
         // type should we return?
         let status = self.active_chain.get_block_status(&self.header.hash());
         if status.contains(BlockStatus::HEADER_VALID) {
-            let header_index = sync_shared
-                .get_header_index_view(
-                    &self.header.hash(),
-                    status.contains(BlockStatus::BLOCK_STORED),
-                )
-                .unwrap_or_else(|| {
-                    panic!(
-                        "header {}-{} with HEADER_VALID should exist",
+            match sync_shared.get_header_index_view(
+                &self.header.hash(),
+                status.contains(BlockStatus::BLOCK_STORED),
+            ) {
+                Some(header_index) => {
+                    state
+                        .peers()
+                        .may_set_best_known_header(self.peer, header_index.as_header_index());
+                }
+                None => {
+                    // The header view can be removed by a concurrent orphan
+                    // cleanup after the status was read. This is a transient
+                    // state, so report it as temporarily invalid instead of
+                    // panicking.
+                    debug!(
+                        "HEADER_VALID status without header view: {}-{}",
                         self.header.number(),
-                        self.header.hash()
-                    )
-                })
-                .as_header_index();
-            state
-                .peers()
-                .may_set_best_known_header(self.peer, header_index);
+                        self.header.hash(),
+                    );
+                    result.temporary_invalid(None);
+                }
+            }
             return result;
         }
 
@@ -334,7 +341,19 @@ impl<'a, DL: HeaderFieldsProvider> HeaderAcceptor<'a, DL> {
             return result;
         }
 
-        sync_shared.insert_valid_header(self.peer, self.header);
+        if sync_shared
+            .insert_valid_header(self.peer, self.header)
+            .is_none()
+        {
+            // The parent header was removed concurrently, treat the header as
+            // temporarily invalid so it can be retried later.
+            debug!(
+                "HeadersProcess missing parent header: {} {}",
+                self.header.number(),
+                self.header.hash(),
+            );
+            result.temporary_invalid(None);
+        }
         result
     }
 }

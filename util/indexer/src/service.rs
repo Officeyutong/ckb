@@ -255,6 +255,9 @@ impl IndexerHandle {
                     if key.len() != prefix.len() + 16 {
                         return None;
                     }
+                } else if key.len() < prefix.len() + 16 {
+                    // Prefix match mode, the matched bytes must not extend into BlockNumber (8) + TxIndex (4) + OutputIndex (4)
+                    return None;
                 }
                 let tx_hash = packed::Byte32::from_slice(&value).expect("stored tx hash");
                 let index =
@@ -473,6 +476,9 @@ impl IndexerHandle {
                     if key.len() != prefix.len() + 17 {
                         continue;
                     }
+                } else if key.len() < prefix.len() + 17 {
+                    // Prefix match mode, the matched bytes must not extend into BlockNumber (8) + TxIndex (4) + CellIndex (4) + CellType (1)
+                    continue;
                 }
                 let tx_hash: H256 = packed::Byte32::from_slice(&value)
                     .expect("stored tx hash")
@@ -590,6 +596,9 @@ impl IndexerHandle {
                         if key.len() != prefix.len() + 17 {
                             return None;
                         }
+                    } else if key.len() < prefix.len() + 17 {
+                        // Prefix match mode, the matched bytes must not extend into BlockNumber (8) + TxIndex (4) + CellIndex (4) + CellType (1)
+                        return None;
                     }
                     let tx_hash = packed::Byte32::from_slice(&value).expect("stored tx hash");
                     let block_number = u64::from_be_bytes(
@@ -732,6 +741,9 @@ impl IndexerHandle {
                     if key.len() != prefix.len() + 16 {
                         return None;
                     }
+                } else if key.len() < prefix.len() + 16 {
+                    // Prefix match mode, the matched bytes must not extend into BlockNumber (8) + TxIndex (4) + OutputIndex (4)
+                    return None;
                 }
                 let tx_hash = packed::Byte32::from_slice(value.as_ref()).expect("stored tx hash");
                 let index =
@@ -999,6 +1011,96 @@ mod tests {
             tmp_dir.path().to_str().unwrap(),
         )
         // Indexer::new(store, 10, 1)
+    }
+
+    #[test]
+    fn prefix_search_does_not_match_into_positional_suffix() {
+        let store: RocksdbStore = new_store("prefix_search_suffix");
+        let indexer = Indexer::new(store.clone(), 10, 100, None, CustomFilters::new(None, None));
+        let rpc = IndexerHandle {
+            store,
+            pool: None,
+            request_limit: usize::MAX,
+            timeout_limit: Duration::from_secs(u64::MAX),
+        };
+
+        let code_hash = H256(rand::random());
+        let lock_script = |args: &[u8]| {
+            ScriptBuilder::default()
+                .code_hash(code_hash.clone())
+                .hash_type(ScriptHashType::Type)
+                .args(Bytes::from(args.to_vec()))
+                .build()
+        };
+        // the key of a cell locked by `short_lock` at block 0 is
+        // `short_lock || 0u64 (BlockNumber) || 0u32 (TxIndex) || 0u32 (OutputIndex)`
+        let short_lock = lock_script(b"lock");
+        let query_lock = lock_script(b"lock\x00\x00\x00\x00");
+        let long_lock = lock_script(b"lock\x00\x00\x00\x00\x01");
+
+        let cellbase = TransactionBuilder::default()
+            .input(CellInput::new_cellbase_input(0))
+            .witness(Script::default().into_witness())
+            .output(
+                CellOutputBuilder::default()
+                    .capacity(capacity_bytes!(1000))
+                    .lock(short_lock)
+                    .build(),
+            )
+            .output_data(Bytes::default())
+            .output(
+                CellOutputBuilder::default()
+                    .capacity(capacity_bytes!(2000))
+                    .lock(long_lock.clone())
+                    .build(),
+            )
+            .output_data(Bytes::default())
+            .build();
+        let block = BlockBuilder::default()
+            .transaction(cellbase)
+            .header(HeaderBuilder::default().number(0).build())
+            .build();
+        indexer.append(&block).unwrap();
+
+        let search_key = |group_by_transaction| IndexerSearchKey {
+            script: query_lock.clone().into(),
+            group_by_transaction,
+            ..Default::default()
+        };
+
+        // only the cell whose lock args really start with the query args is returned
+        let cells = rpc
+            .get_cells(search_key(None), IndexerOrder::Asc, 100.into(), None)
+            .unwrap();
+        assert_eq!(1, cells.objects.len());
+        assert_eq!(
+            long_lock,
+            packed::Script::from(cells.objects[0].output.lock.clone())
+        );
+
+        let capacity = rpc.get_cells_capacity(search_key(None)).unwrap().unwrap();
+        assert_eq!(capacity_bytes!(2000).as_u64(), capacity.capacity.value());
+
+        let txs = rpc
+            .get_transactions(search_key(None), IndexerOrder::Asc, 100.into(), None)
+            .unwrap();
+        assert_eq!(1, txs.objects.len());
+        if let IndexerTx::Ungrouped(tx) = &txs.objects[0] {
+            assert_eq!(1, tx.io_index.value());
+        } else {
+            panic!("expected ungrouped tx");
+        }
+
+        let txs = rpc
+            .get_transactions(search_key(Some(true)), IndexerOrder::Asc, 100.into(), None)
+            .unwrap();
+        assert_eq!(1, txs.objects.len());
+        if let IndexerTx::Grouped(tx) = &txs.objects[0] {
+            assert_eq!(1, tx.cells.len());
+            assert_eq!(1, tx.cells[0].1.value());
+        } else {
+            panic!("expected grouped tx");
+        }
     }
 
     #[test]

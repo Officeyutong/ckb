@@ -46,6 +46,11 @@ use std::time::{Duration, Instant};
 use std::{cmp, fmt, iter};
 
 const GET_HEADERS_CACHE_SIZE: usize = 10000;
+
+/// Upper bound on the number of parent headers walked when locating the common
+/// ancestor from a stored side-chain locator entry. Without a budget, a peer
+/// that has built a deep side chain can make every GetHeaders request walk it.
+const MAX_LOCATOR_WALK_STEPS: usize = 10_000;
 // TODO: Need discussed
 const GET_HEADERS_TIMEOUT: Duration = Duration::from_secs(15);
 const FILTER_SIZE: usize = 50000;
@@ -977,15 +982,21 @@ impl Peers {
     }
 }
 
-// <CompactBlockHash, (CompactBlock, <PeerIndex, (Vec<TransactionsIndex>, Vec<UnclesIndex>)>, timestamp)>
-pub(crate) type PendingCompactBlockMap = HashMap<
-    Byte32,
-    (
-        packed::CompactBlock,
-        HashMap<PeerIndex, (Vec<u32>, Vec<u32>)>,
-        u64,
-    ),
->;
+/// The pending compact block and requested missing indexes recorded for one peer.
+///
+/// The compact block is stored per peer because different peers may announce
+/// different layouts (short-ids and prefilled transactions) for the same block
+/// hash. The recorded indexes are only meaningful for the layout that produced
+/// them, so keep them together with that layout.
+pub(crate) struct PendingCompactBlock {
+    pub(crate) compact_block: packed::CompactBlock,
+    pub(crate) missing_transactions: Vec<u32>,
+    pub(crate) missing_uncles: Vec<u32>,
+}
+
+// <CompactBlockHash, (<PeerIndex, PendingCompactBlock>, timestamp)>
+pub(crate) type PendingCompactBlockMap =
+    HashMap<Byte32, (HashMap<PeerIndex, PendingCompactBlock>, u64)>;
 
 /// Sync state shared between sync and relayer protocol
 #[derive(Clone)]
@@ -1093,16 +1104,18 @@ impl SyncShared {
     // Update the block_status_map
     // Update the shared_best_header if need
     // Update the peer's best_known_header
-    pub fn insert_valid_header(&self, peer: PeerIndex, header: &core::HeaderView) {
+    //
+    // Returns `None` when the parent header is no longer available. That can
+    // happen when a concurrent orphan cleanup removes the parent view between
+    // header verification and insertion, so callers should treat it as a
+    // recoverable condition instead of panicking.
+    pub fn insert_valid_header(&self, peer: PeerIndex, header: &core::HeaderView) -> Option<()> {
         let tip_number = self.active_chain().tip_number();
         let store_first = tip_number >= header.number();
         // We don't use header#parent_hash clone here because it will hold the arc counter of the SendHeaders message
         // which will cause the 2000 headers to be held in memory for a long time
-        let parent_hash = Byte32::from_slice(header.data().raw().parent_hash().as_slice())
-            .expect("checked slice length");
-        let parent_header_index = self
-            .get_header_index_view(&parent_hash, store_first)
-            .expect("parent should be verified");
+        let parent_hash = Byte32::from_slice(header.data().raw().parent_hash().as_slice()).ok()?;
+        let parent_header_index = self.get_header_index_view(&parent_hash, store_first)?;
         let mut header_view = HeaderIndexView::new(
             header.hash(),
             header.number(),
@@ -1140,6 +1153,7 @@ impl SyncShared {
             );
         }
         self.state.may_set_shared_best_header(header_view);
+        Some(())
     }
 
     pub(crate) fn get_header_index_view(
@@ -1374,11 +1388,11 @@ impl SyncState {
         pending.is_empty()
             || pending
                 .get(hash)
-                .map(|(_, _, time)| now.saturating_sub(*time) > 2000)
+                .map(|(_, time)| now.saturating_sub(*time) > 2000)
                 .unwrap_or(true)
     }
 
-    pub async fn pending_compact_blocks(
+    pub(crate) async fn pending_compact_blocks(
         &self,
     ) -> tokio::sync::MutexGuard<'_, PendingCompactBlockMap> {
         self.pending_compact_blocks.lock().await
@@ -1910,47 +1924,68 @@ impl ActiveChain {
         _hash_stop: &Byte32,
         locator: &[Byte32],
     ) -> Option<BlockNumber> {
-        if locator.is_empty() {
-            return None;
-        }
+        self.locate_latest_common_block_with_walk_budget(
+            _hash_stop,
+            locator,
+            MAX_LOCATOR_WALK_STEPS,
+        )
+    }
 
-        let locator_hash = locator.last().expect("empty checked");
+    /// Same as [`Self::locate_latest_common_block`], with an explicit budget for the parent walk
+    /// from a stored side-chain locator entry.
+    pub(crate) fn locate_latest_common_block_with_walk_budget(
+        &self,
+        _hash_stop: &Byte32,
+        locator: &[Byte32],
+        max_walk_steps: usize,
+    ) -> Option<BlockNumber> {
+        let locator_hash = locator.last()?;
         if locator_hash != &self.sync_shared.consensus().genesis_hash() {
             return None;
         }
 
         // iterator are lazy
-        let (index, latest_common) = locator
-            .iter()
-            .enumerate()
-            .map(|(index, hash)| (index, self.snapshot.get_block_number(hash)))
-            .find(|(_index, number)| number.is_some())
-            .expect("locator last checked");
+        let (index, latest_common) = locator.iter().enumerate().find_map(|(index, hash)| {
+            self.snapshot
+                .get_block_number(hash)
+                .map(|number| (index, number))
+        })?;
 
-        if index == 0 || latest_common == Some(0) {
-            return latest_common;
+        if index == 0 || latest_common == 0 {
+            return Some(latest_common);
         }
 
         if let Some(header) = locator
             .get(index - 1)
             .and_then(|hash| self.sync_shared.store().get_block_header(hash))
         {
-            let mut block_hash = header.data().raw().parent_hash();
-            loop {
-                let block_header = match self.sync_shared.store().get_block_header(&block_hash) {
-                    None => break latest_common,
-                    Some(block_header) => block_header,
-                };
-
-                if let Some(block_number) = self.snapshot.get_block_number(&block_hash) {
-                    return Some(block_number);
-                }
-
-                block_hash = block_header.data().raw().parent_hash();
+            if let Some(block_number) =
+                self.walk_parent_headers(&header.data().raw().parent_hash(), max_walk_steps)
+            {
+                return Some(block_number);
             }
+            debug!(
+                "locate_latest_common_block gave up after {} parent steps, fall back to locator entry",
+                max_walk_steps,
+            );
+            Some(latest_common)
         } else {
-            latest_common
+            Some(latest_common)
         }
+    }
+
+    /// Follow parent headers from `block_hash` until a block on the main chain
+    /// is found, or return `None` after `max_steps` hops or a missing header.
+    fn walk_parent_headers(&self, block_hash: &Byte32, max_steps: usize) -> Option<BlockNumber> {
+        let mut block_hash = block_hash.clone();
+        for _ in 0..max_steps {
+            let block_header = self.sync_shared.store().get_block_header(&block_hash)?;
+            if let Some(block_number) = self.snapshot.get_block_number(&block_hash) {
+                return Some(block_number);
+            }
+            block_hash = block_header.data().raw().parent_hash();
+        }
+        None
     }
 
     pub fn get_locator_response(

@@ -346,6 +346,12 @@ impl<'a, 'b, CS: ChainStore + VersionbitsIndexer + 'static> BlockTxsVerifier<'a,
         }
     }
 
+    /// Fetches cache entries for the block's transactions, keyed by witness hash.
+    ///
+    /// A hit skips script execution for that transaction. The entry is not bound to the VM
+    /// version that the current epoch selects, which is deliberate: see
+    /// `ckb_verification::cache::TxVerificationCache` for the reasoning and for the residual
+    /// risk a future semantic-changing hardfork has to handle.
     fn fetched_cache(&self, rtxs: &'a [Arc<ResolvedTransaction>]) -> FetchedTxVerificationCache {
         let (sender, receiver) = oneshot::channel();
         let txs_verify_cache = Arc::clone(self.txs_verify_cache);

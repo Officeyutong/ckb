@@ -300,6 +300,7 @@ pub(crate) fn gen_block(
 pub(crate) struct MockProtocolContext {
     protocol: SupportProtocols,
     sent_messages: RefCell<Vec<(ProtocolId, PeerIndex, P2pBytes)>>,
+    banned_peers: RefCell<Vec<(PeerIndex, Duration, String)>>,
 }
 
 // test mock context with single thread
@@ -312,6 +313,7 @@ impl MockProtocolContext {
         Self {
             protocol,
             sent_messages: Default::default(),
+            banned_peers: Default::default(),
         }
     }
 
@@ -328,6 +330,10 @@ impl MockProtocolContext {
 
     pub(crate) fn sent_messages_len(&self) -> usize {
         self.sent_messages.borrow().len()
+    }
+
+    pub(crate) fn banned_peers_len(&self) -> usize {
+        self.banned_peers.borrow().len()
     }
 }
 
@@ -495,8 +501,10 @@ impl CKBProtocolContext for MockProtocolContext {
     fn report_peer(&self, _peer_index: PeerIndex, _behaviour: Behaviour) {
         unimplemented!();
     }
-    fn ban_peer(&self, _peer_index: PeerIndex, _duration: Duration, _reason: String) {
-        unimplemented!();
+    fn ban_peer(&self, peer_index: PeerIndex, duration: Duration, reason: String) {
+        self.banned_peers
+            .borrow_mut()
+            .push((peer_index, duration, reason));
     }
     fn protocol_id(&self) -> ProtocolId {
         self.protocol.protocol_id()

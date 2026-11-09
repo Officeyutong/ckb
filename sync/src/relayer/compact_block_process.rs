@@ -1,7 +1,7 @@
 use crate::SyncShared;
 use crate::relayer::compact_block_verifier::CompactBlockVerifier;
 use crate::relayer::{ReconstructionResult, Relayer};
-use crate::types::ActiveChain;
+use crate::types::{ActiveChain, PendingCompactBlock};
 use crate::utils::async_send_message_to;
 use crate::{Status, StatusCode, attempt};
 use ckb_chain_spec::consensus::Consensus;
@@ -76,7 +76,23 @@ impl<'a> CompactBlockProcess<'a> {
         // The new arrived has greater difficulty than local best known chain
         attempt!(CompactBlockVerifier::verify(&compact_block));
         // Header has been verified ok, update state
-        shared.insert_valid_header(self.peer, &header);
+        if shared.insert_valid_header(self.peer, &header).is_none() {
+            // The parent header was removed concurrently, ask the peer for
+            // headers again instead of panicking.
+            debug_target!(
+                crate::LOG_TARGET_RELAY,
+                "UnknownParent: {}, send_getheaders_to_peer({})",
+                block_hash,
+                self.peer,
+            );
+            active_chain.send_getheaders_to_peer(
+                &self.nc,
+                self.peer,
+                (&active_chain.tip_header()).into(),
+            );
+            return StatusCode::CompactBlockRequiresParent
+                .with_context(format!("{} parent header is missing", block_hash,));
+        }
 
         // Request proposal
         let proposals: Vec<_> = compact_block.proposals().into_iter().collect();
@@ -110,10 +126,14 @@ impl<'a> CompactBlockProcess<'a> {
                 //
                 // use epoch as the judgment condition because we accept
                 // all block in current epoch as uncle block
-                pending_compact_blocks.retain(|_, (v, _, _)| {
-                    Into::<EpochNumberWithFraction>::into(v.header().as_reader().raw().epoch())
+                pending_compact_blocks.retain(|_, (peers_map, _)| {
+                    peers_map.values().any(|pending| {
+                        Into::<EpochNumberWithFraction>::into(
+                            pending.compact_block.header().as_reader().raw().epoch(),
+                        )
                         .number()
-                        >= block.epoch().number()
+                            >= block.epoch().number()
+                    })
                 });
                 shrink_to_fit!(pending_compact_blocks, 20);
                 self.relayer
@@ -241,17 +261,27 @@ async fn contextual_check(
     let status = active_chain.get_block_status(&block_hash);
     if status.contains(BlockStatus::BLOCK_STORED) {
         // update last common header and best known
-        let parent = shared
-            .get_header_index_view(&compact_block_header.data().raw().parent_hash(), true)
-            .expect("parent block must exist");
-
-        let header_index = HeaderIndex::new(
-            compact_block_header.number(),
-            block_hash.clone(),
-            parent.total_difficulty() + compact_block_header.difficulty(),
-        );
-        let state = shared.state().peers();
-        state.may_set_best_known_header(peer, header_index);
+        match shared.get_header_index_view(&compact_block_header.data().raw().parent_hash(), true) {
+            Some(parent) => {
+                let header_index = HeaderIndex::new(
+                    compact_block_header.number(),
+                    block_hash.clone(),
+                    parent.total_difficulty() + compact_block_header.difficulty(),
+                );
+                let state = shared.state().peers();
+                state.may_set_best_known_header(peer, header_index);
+            }
+            None => {
+                // The parent header may be removed by a concurrent orphan
+                // cleanup; the block is already stored, so skip updating the
+                // best known header instead of panicking.
+                debug_target!(
+                    crate::LOG_TARGET_RELAY,
+                    "stored block {}, but its parent header is missing, skip updating best known header",
+                    block_hash,
+                );
+            }
+        }
 
         return StatusCode::CompactBlockAlreadyStored.with_context(block_hash);
     } else if status.contains(BlockStatus::BLOCK_RECEIVED) {
@@ -285,7 +315,7 @@ async fn contextual_check(
     let pending_compact_blocks = shared.state().pending_compact_blocks().await;
     if pending_compact_blocks
         .get(&block_hash)
-        .map(|(_, peers_map, _)| peers_map.contains_key(&peer))
+        .map(|(peers_map, _)| peers_map.contains_key(&peer))
         .unwrap_or(false)
     {
         return StatusCode::CompactBlockIsAlreadyPending.with_context(block_hash);
@@ -296,8 +326,9 @@ async fn contextual_check(
         |block_hash| {
             pending_compact_blocks
                 .get(&block_hash)
-                .map(|(compact_block, _, _)| {
-                    let header = compact_block.header().into_view();
+                .and_then(|(peers_map, _)| peers_map.values().next())
+                .map(|pending| {
+                    let header = pending.compact_block.header().into_view();
                     HeaderFields {
                         hash: header.hash(),
                         number: header.number(),
@@ -340,22 +371,27 @@ async fn contextual_check(
     }
 
     let parent_hash = compact_block_header.parent_hash();
-    let maybe_epoch = if let Some(parent_header) = shared.store().get_block_header(&parent_hash) {
-        shared
-            .consensus()
-            .next_epoch_ext(&parent_header, &shared.store().borrow_as_data_loader())
-            .map(|next_epoch| next_epoch.epoch())
-    } else {
-        let parent_epoch = parent.epoch();
-        if parent_epoch.index() + 1 < parent_epoch.length() {
-            shared
-                .store()
-                .get_epoch_index(parent_epoch.number())
-                .and_then(|index| shared.store().get_epoch_ext(&index))
+    let (maybe_epoch, epoch_context_is_complete) =
+        if let Some(parent_header) = shared.store().get_block_header(&parent_hash) {
+            (
+                shared
+                    .consensus()
+                    .next_epoch_ext(&parent_header, &shared.store().borrow_as_data_loader())
+                    .map(|next_epoch| next_epoch.epoch()),
+                true,
+            )
         } else {
-            None
-        }
-    };
+            let parent_epoch = parent.epoch();
+            let epoch = if parent_epoch.index() + 1 < parent_epoch.length() {
+                shared
+                    .store()
+                    .get_epoch_index(parent_epoch.number())
+                    .and_then(|index| shared.store().get_epoch_ext(&index))
+            } else {
+                None
+            };
+            (epoch, false)
+        };
 
     let Some(epoch) = maybe_epoch else {
         return StatusCode::CompactBlockRequiresParent.with_context(format!(
@@ -368,6 +404,14 @@ async fn contextual_check(
     let expected_compact_target = epoch.compact_target();
     let actual_compact_target = compact_block_header.compact_target();
     if actual_epoch != expected_epoch || actual_compact_target != expected_compact_target {
+        // An epoch obtained by number alone is canonical-chain data, while the
+        // header-only parent may belong to another fork. Without the parent body
+        // this mismatch is not proof that the compact block is invalid.
+        if !epoch_context_is_complete {
+            return StatusCode::CompactBlockRequiresParent.with_context(format!(
+                "{block_hash} requires parent {parent_hash} to verify epoch"
+            ));
+        }
         shared
             .shared()
             .insert_block_status(block_hash.clone(), BlockStatus::BLOCK_INVALID);
@@ -394,9 +438,16 @@ async fn missing_or_collided_post_process(
         .pending_compact_blocks()
         .await
         .entry(block_hash.clone())
-        .or_insert_with(|| (compact_block, HashMap::default(), unix_time_as_millis()))
-        .1
-        .insert(peer, (missing_transactions.clone(), missing_uncles.clone()));
+        .or_insert_with(|| (HashMap::default(), unix_time_as_millis()))
+        .0
+        .insert(
+            peer,
+            PendingCompactBlock {
+                compact_block,
+                missing_transactions: missing_transactions.clone(),
+                missing_uncles: missing_uncles.clone(),
+            },
+        );
 
     let content = packed::GetBlockTransactions::new_builder()
         .block_hash(block_hash)

@@ -1,7 +1,8 @@
 use ckb_chain::{ChainController, ChainServiceScope};
 use ckb_chain_spec::consensus::{Consensus, ConsensusBuilder};
 use ckb_constant::sync::{
-    CHAIN_SYNC_TIMEOUT, EVICTION_HEADERS_RESPONSE_TIME, MAX_LOCATOR_SIZE, MAX_TIP_AGE,
+    CHAIN_SYNC_TIMEOUT, EVICTION_HEADERS_RESPONSE_TIME, MAX_HEADERS_LEN, MAX_LOCATOR_SIZE,
+    MAX_TIP_AGE,
 };
 use ckb_dao::DaoCalculator;
 use ckb_error::InternalErrorKind;
@@ -298,6 +299,88 @@ fn test_locate_latest_common_block2() {
     assert_eq!(
         shared1.snapshot().get_block_hash(latest_common).unwrap(),
         shared1.snapshot().get_block_hash(fork).unwrap()
+    );
+}
+
+#[test]
+fn test_locate_latest_common_block_walk_budget() {
+    let consensus = Consensus::default();
+    let (chain1, shared1, _) = start_chain(Some(consensus.clone()));
+    let (chain2, shared2, synchronizer2) = start_chain(Some(consensus.clone()));
+    let block_number = 200;
+    let fork_index = 150;
+
+    // A shared main chain on both nodes.
+    let mut blocks: Vec<BlockView> = Vec::new();
+    let mut parent = consensus.genesis_block().header();
+    for i in 1..block_number {
+        let store = shared1.store();
+        let epoch = shared1
+            .consensus()
+            .next_epoch_ext(&parent, &store.borrow_as_data_loader())
+            .unwrap()
+            .epoch();
+        let new_block = gen_block(&shared1, &parent, &epoch, i);
+        blocks.push(new_block.clone());
+
+        chain1
+            .chain_controller()
+            .blocking_process_block_with_switch(Arc::new(new_block.clone()), Switch::DISABLE_ALL)
+            .expect("process block ok");
+        chain2
+            .chain_controller()
+            .blocking_process_block_with_switch(Arc::new(new_block.clone()), Switch::DISABLE_ALL)
+            .expect("process block ok");
+        parent = new_block.header().to_owned();
+    }
+
+    // A short stored side chain on node2, forking below the tooltip, so it
+    // stays non-best (less total work than the main chain).
+    let fork = blocks[fork_index].header();
+    let fork_number = fork.number();
+    let mut side_parent = fork.clone();
+    let mut side_tip = fork;
+    for i in 0..20 {
+        let store = shared2.store();
+        let epoch = shared2
+            .consensus()
+            .next_epoch_ext(&side_parent, &store.borrow_as_data_loader())
+            .unwrap()
+            .epoch();
+        let new_block = gen_block(&shared2, &side_parent, &epoch, i + 1000);
+        chain2
+            .chain_controller()
+            .blocking_process_block_with_switch(Arc::new(new_block.clone()), Switch::DISABLE_ALL)
+            .expect("process block ok");
+        side_tip = new_block.header();
+        side_parent = new_block.header();
+    }
+
+    // locator[0] is a stored side-chain block, locator[1] is a main-chain block
+    // below the fork, so the walk has to descend the side chain to find the fork.
+    let locator = [
+        side_tip.hash(),
+        blocks[99].hash(), // block 100, on the main chain
+        consensus.genesis_hash(),
+    ];
+
+    // A sufficient budget reaches the real fork.
+    assert_eq!(
+        synchronizer2
+            .shared
+            .active_chain()
+            .locate_latest_common_block(&Byte32::zero(), &locator[..]),
+        Some(fork_number)
+    );
+
+    // A tiny budget stops after a couple of hops and falls back to the
+    // main-chain locator entry instead of walking the whole side chain.
+    assert_eq!(
+        synchronizer2
+            .shared
+            .active_chain()
+            .locate_latest_common_block_with_walk_budget(&Byte32::zero(), &locator[..], 2),
+        Some(100)
     );
 }
 
@@ -1295,6 +1378,23 @@ fn get_headers_rejects_oversized_locator_before_processing() {
             MAX_LOCATOR_SIZE + 1
         )
     );
+}
+
+#[test]
+fn headers_process_rejects_oversized_headers() {
+    let (_chain, _shared, synchronizer) = start_chain(Some(Consensus::default()));
+    let message = SendHeadersBuilder::default()
+        .headers(vec![packed::Header::default(); MAX_HEADERS_LEN + 1])
+        .build();
+    let nc = Arc::new(mock_network_context(1)) as Arc<dyn CKBProtocolContext + Sync + 'static>;
+
+    let status = HeadersProcess::new(message.as_reader(), &synchronizer, 0.into(), &nc).execute();
+
+    assert_eq!(
+        status,
+        StatusCode::HeadersIsInvalid.with_context("oversize")
+    );
+    assert!(status.should_ban().is_some());
 }
 
 #[test]

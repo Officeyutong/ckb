@@ -18,7 +18,7 @@ use ckb_freezer::Freezer;
 use ckb_merkle_mountain_range::{Error as MMRError, MMRStore, Result as MMRResult};
 use ckb_types::{
     core::{
-        BlockExt, BlockView, EpochExt, HeaderView, TransactionView,
+        BlockExt, BlockView, EpochExt, EpochNumber, HeaderView, TransactionView,
         cell::{CellChecker, CellProvider, CellStatus},
     },
     packed::{self, Byte32, OutPoint},
@@ -295,8 +295,14 @@ impl StoreTransaction {
         self.insert_raw(COLUMN_INDEX, block_hash.as_slice(), block_number.as_slice())
     }
 
-    /// Detaches a block from the main chain, removing its transaction and uncle indices.
+    /// Detaches a block from the main chain, removing its canonical indices.
     pub fn detach_block(&self, block: &BlockView) -> Result<(), Error> {
+        if block.epoch().index() == 0 {
+            // The replacement fork may not reach this epoch. Its index must disappear
+            // even when no attached epoch head overwrites it; retain the fork's data.
+            let epoch_number: packed::Uint64 = block.epoch().number().into();
+            self.delete(COLUMN_EPOCH, epoch_number.as_slice())?;
+        }
         for tx_hash in block.tx_hashes().iter() {
             self.delete(COLUMN_TRANSACTION_INFO, tx_hash.as_slice())?;
         }
@@ -321,15 +327,33 @@ impl StoreTransaction {
         )
     }
 
-    /// Inserts epoch extension data.
+    /// Inserts epoch extension data keyed by its last block hash in the previous epoch.
     pub fn insert_epoch_ext(&self, hash: &packed::Byte32, epoch: &EpochExt) -> Result<(), Error> {
         self.insert_raw(
             COLUMN_EPOCH,
             hash.as_slice(),
             Into::<packed::EpochExt>::into(epoch).as_slice(),
-        )?;
-        let epoch_number: packed::Uint64 = epoch.number().into();
+        )
+    }
+
+    /// Updates the canonical epoch-number-to-epoch-hash index.
+    pub fn insert_epoch_index(
+        &self,
+        number: EpochNumber,
+        hash: &packed::Byte32,
+    ) -> Result<(), Error> {
+        let epoch_number: packed::Uint64 = number.into();
         self.insert_raw(COLUMN_EPOCH, epoch_number.as_slice(), hash.as_slice())
+    }
+
+    /// Inserts epoch extension data and updates its canonical epoch-number index.
+    pub fn insert_canonical_epoch_ext(
+        &self,
+        hash: &packed::Byte32,
+        epoch: &EpochExt,
+    ) -> Result<(), Error> {
+        self.insert_epoch_ext(hash, epoch)?;
+        self.insert_epoch_index(epoch.number(), hash)
     }
 
     /// Inserts the current epoch extension data.

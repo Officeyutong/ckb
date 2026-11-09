@@ -22,7 +22,10 @@ fn system_time_as_millis() -> u64 {
     let duration = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("SystemTime before UNIX EPOCH!");
-    duration.as_secs() * 1000 + u64::from(duration.subsec_millis())
+    duration
+        .as_secs()
+        .saturating_mul(1000)
+        .saturating_add(u64::from(duration.subsec_millis()))
 }
 
 /// Get system's timestamp in millis

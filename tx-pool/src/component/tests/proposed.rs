@@ -747,6 +747,56 @@ fn test_max_ancestors_evicts_stale_parent_descendant() {
     assert!(pool.calc_ancestors(&tx3_id).is_empty());
 }
 
+fn assert_total_stat_consistent(pool: &PoolMap) {
+    let (size, cycles) = pool.iter().fold((0usize, 0u64), |(size, cycles), entry| {
+        (size + entry.inner.size, cycles + entry.inner.cycles)
+    });
+    assert_eq!(pool.total_tx_size, size);
+    assert_eq!(pool.total_tx_cycles, cycles);
+}
+
+#[test]
+fn test_max_ancestors_evicts_keeps_total_stat_consistent() {
+    let mut pool = PoolMap::new(2);
+    let dep_hash: Byte32 = h256!("0x1").into();
+
+    let tx1 = build_tx_with_dep(vec![(&Byte32::zero(), 0)], vec![(&dep_hash, 0)], 1);
+    let tx1_hash = tx1.hash();
+    let tx2 = build_tx(vec![(&tx1_hash, 0)], 1);
+    let tx2_hash = tx2.hash();
+    let tx3 = build_tx(vec![(&dep_hash, 0), (&tx2_hash, 0)], 1);
+    let tx3_id = tx3.proposal_short_id();
+
+    pool.add_proposed(TxEntry::new(
+        dummy_resolve(tx1, |_| None),
+        100,
+        MOCK_FEE,
+        1000,
+    ))
+    .unwrap();
+    pool.add_proposed(TxEntry::dummy_resolve(tx2, 200, MOCK_FEE, 2000))
+        .unwrap();
+    assert_total_stat_consistent(&pool);
+
+    // tx3 consumes the cell referenced by tx1, so tx1 and its descendant tx2 are evicted
+    let (inserted, evicted) = pool
+        .add_entry(
+            TxEntry::dummy_resolve(tx3, 400, MOCK_FEE, 4000),
+            Status::Proposed,
+        )
+        .unwrap();
+    assert!(inserted);
+    assert_eq!(evicted.len(), 2);
+    assert_eq!(pool.size(), 1);
+    assert_eq!(pool.total_tx_size, 4000);
+    assert_eq!(pool.total_tx_cycles, 400);
+    assert_total_stat_consistent(&pool);
+
+    pool.remove_entry(&tx3_id);
+    assert_eq!(pool.total_tx_size, 0);
+    assert_eq!(pool.total_tx_cycles, 0);
+}
+
 #[test]
 fn test_container_bench_add_limits() {
     use rand::Rng;

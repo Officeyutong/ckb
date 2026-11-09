@@ -191,7 +191,7 @@ impl ChainDB {
         db_txn.insert_tip_header(&genesis.header())?;
         db_txn.insert_current_epoch_ext(epoch)?;
         db_txn.insert_block_epoch_index(&genesis_hash, &last_block_hash_in_previous_epoch)?;
-        db_txn.insert_epoch_ext(&last_block_hash_in_previous_epoch, epoch)?;
+        db_txn.insert_canonical_epoch_ext(&last_block_hash_in_previous_epoch, epoch)?;
         db_txn.attach_block(genesis)?;
 
         let mut mmr = ChainRootMMR::new(0, &db_txn);
