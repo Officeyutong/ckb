@@ -193,7 +193,9 @@ impl RPCError {
             Reject::Verification(error) if reject.is_verification_interrupted() => {
                 return Self::from_ckb_error(error.clone());
             }
-            Reject::Verification(_) => RPCError::TransactionFailedToVerify,
+            Reject::Verification(_) | Reject::PoolPolicy(_) => {
+                RPCError::TransactionFailedToVerify
+            }
             Reject::RBFRejected(_) => RPCError::PoolRejectedRBF,
             Reject::Invalidated(_) => RPCError::PoolRejectedInvalidated,
             Reject::ExceededTransactionSizeLimit(_, _) => {

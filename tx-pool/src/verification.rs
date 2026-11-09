@@ -8,7 +8,7 @@ mod execution;
 mod tests;
 
 use crate::error::Reject;
-use ckb_script::ChunkCommand;
+use ckb_script::{ChunkCommand, ScriptError, TransactionScriptError};
 use ckb_snapshot::Snapshot;
 use ckb_store::ChainStore;
 use ckb_store::data_loader_wrapper::AsDataLoader;
@@ -19,6 +19,23 @@ use ckb_verification::{
 };
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::watch, task::block_in_place};
+
+fn classify_verification_error(error: ckb_error::Error) -> Reject {
+    let strict_only = error
+        .root_cause()
+        .downcast_ref::<TransactionScriptError>()
+        .is_some_and(|script_error| {
+            matches!(
+                script_error.script_error(),
+                ScriptError::VMInternalError(vm_error) if vm_error.is_raised_by_strict()
+            )
+        });
+    if strict_only {
+        Reject::PoolPolicy(error)
+    } else {
+        Reject::Verification(error)
+    }
+}
 
 pub(crate) async fn verify_rtx(
     snapshot: Arc<Snapshot>,
@@ -32,31 +49,30 @@ pub(crate) async fn verify_rtx(
     let consensus = snapshot.cloned_consensus();
     let data_loader = snapshot.as_data_loader();
 
+    DaoScriptSizeVerifier::new(
+        Arc::clone(&rtx),
+        Arc::clone(&consensus),
+        snapshot.borrow_as_data_loader(),
+    )
+    .verify()
+    .map_err(Reject::Verification)?;
     let new_verifier = || {
-        DaoScriptSizeVerifier::new(
-            Arc::clone(&rtx),
-            Arc::clone(&consensus),
-            snapshot.borrow_as_data_loader(),
+        ContextualTransactionVerifier::new_with_cached_script_cycles(
+            rtx,
+            consensus,
+            data_loader,
+            tx_env,
+            cache_entry.map(|entry| entry.cycles),
         )
-        .verify()?;
-        Ok::<_, ckb_error::Error>(
-            ContextualTransactionVerifier::new_with_cached_script_cycles(
-                rtx,
-                consensus,
-                data_loader,
-                tx_env,
-                cache_entry.map(|entry| entry.cycles),
-            )
-            .with_validation_mode(ckb_script::ValidationMode::Strict),
-        )
+        .with_validation_mode(ckb_script::ValidationMode::Strict)
     };
 
     match (command_rx, cpu_time_limit) {
         // RPC submissions keep the whole synchronous check off the async worker.
-        (None, None) => block_in_place(|| new_verifier()?.verify(max_tx_verify_cycles, false))
-            .map_err(Reject::Verification),
+        (None, None) => block_in_place(|| new_verifier().verify(max_tx_verify_cycles, false))
+            .map_err(classify_verification_error),
         (command_rx, cpu_time_limit) => {
-            let verifier = new_verifier().map_err(Reject::Verification)?;
+            let verifier = new_verifier();
             // RPC dry runs and direct orphans have no worker control channel.
             let mut resume_channel;
             let command_rx = match command_rx {
@@ -75,7 +91,7 @@ pub(crate) async fn verify_rtx(
                     },
                 )
                 .await
-                .map_err(Reject::Verification)?
+                .map_err(classify_verification_error)?
                 .ok_or_else(|| {
                     if let Some(metrics) = ckb_metrics::handle() {
                         metrics.ckb_tx_pool_vm_cpu_budget_refusals_total.inc();
