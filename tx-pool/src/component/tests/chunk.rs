@@ -11,7 +11,7 @@ use ckb_db::RocksDB;
 use ckb_fee_estimator::FeeEstimator;
 use ckb_network::SessionId;
 use ckb_network::network::TransportType;
-use ckb_network::{Flags, NetworkService, NetworkState};
+use ckb_network::{Flags, NetworkService, NetworkState, PeerIndex};
 use ckb_snapshot::Snapshot;
 use ckb_store::ChainDB;
 use ckb_types::H256;
@@ -478,7 +478,7 @@ async fn notify_tx_notifies_relayer_when_verify_queue_is_full() {
         .await
         .set_total_tx_size_for_test(256_000_000 - 1);
 
-    let ret = service.notify_tx(tx).await;
+    let ret = service.notify_tx(tx, None).await;
 
     assert!(matches!(ret, Err(crate::error::Reject::Full(_))));
     match tx_relay_receiver
@@ -490,4 +490,28 @@ async fn notify_tx_notifies_relayer_when_verify_queue_is_full() {
         }
         _ => panic!("expected reject notification"),
     }
+}
+
+#[tokio::test]
+async fn notify_tx_from_remote_peer_bans_its_malformed_tx_and_drops_its_queued_txs() {
+    let (service, _tx_relay_receiver) = service_with_relay_receiver();
+    let peer: PeerIndex = 1.into();
+
+    // A tx supplied by `peer` is waiting in the verify queue.
+    let queued = build_tx(vec![(&H256([2; 32]).into(), 0)], 1);
+    let queued_id = queued.proposal_short_id();
+    assert!(
+        service
+            .submit_remote_tx(queued, MAX_TX_VERIFY_CYCLES, peer)
+            .await
+            .is_ok()
+    );
+    assert!(service.verify_queue.read().await.contains_key(&queued_id));
+
+    // A malformed tx supplied by the same peer is attributed to it: the peer
+    // is penalized and its queued txs are removed.
+    let malformed = TransactionBuilder::default().build();
+    let ret = service.notify_tx(malformed, Some(peer)).await;
+    assert!(matches!(ret, Err(ref reject) if reject.is_malformed_tx()));
+    assert!(!service.verify_queue.read().await.contains_key(&queued_id));
 }

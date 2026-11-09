@@ -383,9 +383,23 @@ impl TxPoolService {
             .await
     }
 
-    pub(crate) async fn notify_tx(&self, tx: TransactionView) -> Result<bool, Reject> {
-        self.resumeble_process_tx_and_notify_full_reject(tx, true, None)
-            .await
+    pub(crate) async fn notify_tx(
+        &self,
+        tx: TransactionView,
+        remote: Option<PeerIndex>,
+    ) -> Result<bool, Reject> {
+        let ret = self
+            .resumeble_process_tx_and_notify_full_reject(tx, true, None)
+            .await;
+        // A malformed tx is attributed to the peer that supplied it even on the
+        // proposal path, so it cannot be used to bypass the malformed-tx ban.
+        if let Err(reject) = &ret
+            && let Some(peer) = remote
+            && reject.is_malformed_tx()
+        {
+            self.ban_malformed(peer, format!("reject {reject}")).await;
+        }
+        ret
     }
 
     pub(crate) async fn test_accept_tx(&self, tx: TransactionView) -> Result<Completed, Reject> {
