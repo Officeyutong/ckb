@@ -551,7 +551,7 @@ async fn interrupted_relay_and_proposal_verification_releases_without_recording(
     let pool = service.tx_pool.read().await;
     let recent = pool.recent_reject.as_ref().unwrap();
     assert!(recent.get(&tx.hash()).unwrap().is_none());
-    assert_eq!(recent.get_estimate_total_keys_num(), 0); 
+    assert_eq!(recent.get_estimate_total_keys_num(), 0);
 }
 
 #[tokio::test]
