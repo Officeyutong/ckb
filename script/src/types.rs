@@ -823,6 +823,12 @@ impl<DL> TxInfo<DL> {
     }
 
     /// Returns the version of the machine based on the script and the consensus rules.
+    ///
+    /// The result depends on the transaction's epoch and on the hardfork switch, so the same
+    /// transaction can select a different version on either side of a fork. Anything that
+    /// memoises script results across blocks has to account for that; the transaction
+    /// verification cache deliberately does not bind its entries to this version, see
+    /// `ckb_verification::cache::TxVerificationCache`.
     pub fn select_version(&self, script: &Script) -> Result<ScriptVersion, ScriptError> {
         let is_vm_version_2_and_syscalls_3_enabled = self.is_vm_version_2_and_syscalls_3_enabled();
         let is_vm_version_1_and_syscalls_2_enabled = self.is_vm_version_1_and_syscalls_2_enabled();

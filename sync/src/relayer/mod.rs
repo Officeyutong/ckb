@@ -170,7 +170,9 @@ impl Relayer {
                     .await
             }
             packed::RelayMessageUnionReader::BlockProposal(reader) => {
-                BlockProposalProcess::new(reader, self).execute().await
+                BlockProposalProcess::new(reader, self, peer)
+                    .execute()
+                    .await
             }
         }
     }

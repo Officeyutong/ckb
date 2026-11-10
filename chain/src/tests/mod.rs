@@ -3,6 +3,7 @@ mod block_assembler;
 mod cell;
 mod delay_verify;
 mod dep_cell;
+mod epoch_index;
 mod find_fork;
 mod load_code_with_snapshot;
 mod load_input_cell_data;

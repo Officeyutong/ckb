@@ -83,7 +83,7 @@ impl MockStore {
             .insert_block_epoch_index(&block.hash(), &last_block_hash_in_previous_epoch)
             .unwrap();
         db_txn
-            .insert_epoch_ext(&last_block_hash_in_previous_epoch, epoch_ext)
+            .insert_canonical_epoch_ext(&last_block_hash_in_previous_epoch, epoch_ext)
             .unwrap();
         {
             let parent_block_ext = self.store().get_block_ext(&block.parent_hash()).unwrap();

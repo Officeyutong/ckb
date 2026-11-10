@@ -131,6 +131,11 @@ where
         }
     }
 
+    /// Returns the cached cycle count when an entry is present, without executing the script.
+    ///
+    /// Cached results are deliberately not bound to the VM version selected for the current
+    /// epoch; see `ckb_verification::cache::TxVerificationCache` for the reasoning and for what
+    /// a future semantic-changing hardfork has to account for.
     fn verify(&self, max_cycles: Cycle) -> Result<Cycle, Error> {
         match self.cached_cycles {
             Some(cycles) if cycles <= max_cycles => Ok(cycles),
