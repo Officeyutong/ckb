@@ -45,6 +45,11 @@ pub enum Reject {
     #[error("Declared wrong cycles {0}, actual {1}")]
     DeclaredWrongCycles(Cycle, Cycle),
 
+    /// Verification exceeded this node's cumulative CKB-VM CPU-time limit.
+    /// This is a retryable resource limit, not consensus invalidity.
+    #[error("Transaction verification exceeded the local tx-pool CPU-time limit")]
+    ExcessiveVerifyTime,
+
     /// Resolve failed
     #[error("Resolve failed {0}")]
     Resolve(OutPointError),
@@ -98,7 +103,33 @@ impl Reject {
 
     /// Returns true if the reject should be recorded.
     pub fn should_recorded(&self) -> bool {
-        !matches!(self, Reject::Duplicated(..))
+        !matches!(self, Self::Duplicated(..)) && !self.is_verification_interrupted()
+    }
+
+    /// A CPU budget or node interruption stopped verification.
+    /// CPU budget exhaustion and node interruption are retryable; exceeding
+    /// the consensus cycle limit is still an ordinary verification rejection.
+    pub fn is_verification_interrupted(&self) -> bool {
+        match self {
+            Self::ExcessiveVerifyTime => true,
+            Self::Verification(error) => {
+                error.kind() == ErrorKind::Internal
+                    && error
+                        .downcast_ref::<InternalError>()
+                        .is_some_and(|error| error.kind() == InternalErrorKind::Interrupts)
+            }
+            Self::LowFeeRate(..)
+            | Self::Full(..)
+            | Self::Duplicated(..)
+            | Self::ExceededMaximumAncestorsCount
+            | Self::ExceededTransactionSizeLimit(..)
+            | Self::Malformed(..)
+            | Self::DeclaredWrongCycles(..)
+            | Self::Resolve(..)
+            | Self::Expiry(..)
+            | Self::RBFRejected(..)
+            | Self::Invalidated(..) => false,
+        }
     }
 
     /// Returns true if tx can be resubmitted, allowing relay

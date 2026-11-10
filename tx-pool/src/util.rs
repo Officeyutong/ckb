@@ -2,20 +2,16 @@ use crate::error::Reject;
 use crate::pool::TxPool;
 use ckb_chain_spec::consensus::Consensus;
 use ckb_dao::DaoCalculator;
-use ckb_script::ChunkCommand;
 use ckb_snapshot::Snapshot;
 use ckb_store::ChainStore;
 use ckb_store::data_loader_wrapper::AsDataLoader;
 use ckb_types::core::{
-    Capacity, Cycle, TransactionView, cell::ResolvedTransaction, tx_pool::TRANSACTION_SIZE_LIMIT,
+    Capacity, TransactionView, cell::ResolvedTransaction, tx_pool::TRANSACTION_SIZE_LIMIT,
 };
 use ckb_verification::{
-    ContextualTransactionVerifier, DaoScriptSizeVerifier, NonContextualTransactionVerifier,
-    TimeRelativeTransactionVerifier, TxVerifyEnv,
-    cache::{CachedScriptCycles, Completed},
+    NonContextualTransactionVerifier, TimeRelativeTransactionVerifier, TxVerifyEnv,
 };
 use std::sync::Arc;
-use tokio::{sync::watch, task::block_in_place};
 
 pub(crate) fn check_duplicate_proposal_id(
     tx_pool: &TxPool,
@@ -83,59 +79,6 @@ pub(crate) fn non_contextual_verify(
     }
 
     Ok(())
-}
-
-fn verify_dao_script_size(
-    snapshot: &Snapshot,
-    rtx: Arc<ResolvedTransaction>,
-) -> Result<(), ckb_error::Error> {
-    DaoScriptSizeVerifier::new(
-        Arc::clone(&rtx),
-        snapshot.cloned_consensus(),
-        snapshot.borrow_as_data_loader(),
-    )
-    .verify()
-}
-
-pub(crate) async fn verify_rtx(
-    snapshot: Arc<Snapshot>,
-    rtx: Arc<ResolvedTransaction>,
-    tx_env: Arc<TxVerifyEnv>,
-    cache_entry: &Option<CachedScriptCycles>,
-    max_tx_verify_cycles: Cycle,
-    command_rx: Option<&mut watch::Receiver<ChunkCommand>>,
-) -> Result<Completed, Reject> {
-    let consensus = snapshot.cloned_consensus();
-    let data_loader = snapshot.as_data_loader();
-
-    let cached_script_cycles = cache_entry.map(|entry| entry.cycles);
-
-    if let Some(command_rx) = command_rx {
-        verify_dao_script_size(&snapshot, Arc::clone(&rtx)).map_err(Reject::Verification)?;
-        ContextualTransactionVerifier::new_with_cached_script_cycles(
-            Arc::clone(&rtx),
-            consensus,
-            data_loader,
-            Arc::clone(&tx_env),
-            cached_script_cycles,
-        )
-        .verify_with_pause(max_tx_verify_cycles, command_rx)
-        .await
-        .map_err(Reject::Verification)
-    } else {
-        block_in_place(|| {
-            verify_dao_script_size(&snapshot, Arc::clone(&rtx)).map_err(Reject::Verification)?;
-            ContextualTransactionVerifier::new_with_cached_script_cycles(
-                Arc::clone(&rtx),
-                consensus,
-                data_loader,
-                tx_env,
-                cached_script_cycles,
-            )
-            .verify(max_tx_verify_cycles, false)
-            .map_err(Reject::Verification)
-        })
-    }
 }
 
 pub(crate) fn time_relative_verify(

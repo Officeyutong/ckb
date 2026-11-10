@@ -201,13 +201,13 @@ macro_rules! send_notify {
 impl TxPoolController {
     /// Return whether tx-pool service is started
     pub fn service_started(&self) -> bool {
-        self.started.load(Ordering::Acquire)
+        self.started.load(Ordering::SeqCst)
     }
 
     /// Set tx-pool service started, should only used for test
     #[cfg(feature = "internal")]
     pub fn set_service_started(&self, v: bool) {
-        self.started.store(v, Ordering::Release);
+        self.started.store(v, Ordering::SeqCst);
     }
 
     /// Return reference of tokio runtime handle
@@ -591,6 +591,7 @@ impl TxPoolServiceBuilder {
 
     /// Start a background thread tx-pool service by taking ownership of the Builder, and returns a TxPoolController.
     pub fn start(self, network: NetworkController) {
+        crate::verification::calibration::initialize();
         let consensus = self.snapshot.cloned_consensus();
 
         let verify_queue = Arc::new(RwLock::new(VerifyQueue::new(
@@ -749,7 +750,7 @@ impl TxPoolServiceBuilder {
                 }
             }
         });
-        self.started.store(true, Ordering::Release);
+        self.started.store(true, Ordering::SeqCst);
         if let Err(err) = self.tx_pool_controller.load_persisted_data(txs) {
             error!("Failed to import persistent txs, cause: {}", err);
         }

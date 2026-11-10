@@ -135,3 +135,28 @@ impl From<TxPoolConfig> for crate::TxPoolConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_time_cap_is_not_a_user_configuration() {
+        let config = crate::TxPoolConfig::default();
+        let value = toml::Value::try_from(config).unwrap();
+        let _: TxPoolConfig = value.clone().try_into().unwrap();
+        for field in [
+            "max_tx_verify_time_ms",
+            "min_tx_verify_time_ms",
+            "cycles_per_ms",
+        ] {
+            assert!(!value.as_table().unwrap().contains_key(field));
+            let mut configured = value.clone();
+            configured
+                .as_table_mut()
+                .unwrap()
+                .insert(field.into(), toml::Value::Integer(1));
+            assert!(configured.try_into::<TxPoolConfig>().is_err(), "{field}");
+        }
+    }
+}

@@ -12,6 +12,7 @@ mod pool_cell;
 mod process;
 pub mod service;
 mod util;
+mod verification;
 mod verify_mgr;
 
 pub use ckb_jsonrpc_types::BlockTemplate;

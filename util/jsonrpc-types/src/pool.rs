@@ -303,7 +303,7 @@ pub enum PoolTransactionReject {
     /// Transaction exceeded maximum size limit
     ExceededTransactionSizeLimit(String),
 
-    /// Transactions are replaced because the pool is full
+    /// The transaction pool is full
     Full(String),
 
     /// Transaction already exists in transaction_pool
@@ -331,9 +331,12 @@ pub enum PoolTransactionReject {
     Invalidated(String),
 }
 
-impl From<Reject> for PoolTransactionReject {
-    fn from(reject: Reject) -> Self {
-        match reject {
+/// Interrupted verification has no public transaction-rejection representation.
+impl TryFrom<Reject> for PoolTransactionReject {
+    type Error = Reject;
+
+    fn try_from(reject: Reject) -> Result<Self, Self::Error> {
+        Ok(match reject {
             Reject::LowFeeRate(..) => Self::LowFeeRate(format!("{reject}")),
             Reject::ExceededMaximumAncestorsCount => {
                 Self::ExceededMaximumAncestorsCount(format!("{reject}"))
@@ -342,15 +345,17 @@ impl From<Reject> for PoolTransactionReject {
                 Self::ExceededTransactionSizeLimit(format!("{reject}"))
             }
             Reject::Full(..) => Self::Full(format!("{reject}")),
+            Reject::ExcessiveVerifyTime => return Err(reject),
             Reject::Duplicated(_) => Self::Duplicated(format!("{reject}")),
             Reject::Malformed(_, _) => Self::Malformed(format!("{reject}")),
             Reject::DeclaredWrongCycles(..) => Self::DeclaredWrongCycles(format!("{reject}")),
             Reject::Resolve(_) => Self::Resolve(format!("{reject}")),
+            Reject::Verification(_) if reject.is_verification_interrupted() => return Err(reject),
             Reject::Verification(_) => Self::Verification(format!("{reject}")),
             Reject::Expiry(_) => Self::Expiry(format!("{reject}")),
             Reject::RBFRejected(_) => Self::RBFRejected(format!("{reject}")),
             Reject::Invalidated(_) => Self::Invalidated(format!("{reject}")),
-        }
+        })
     }
 }
 

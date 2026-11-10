@@ -7,7 +7,10 @@ use ckb_dao::DaoCalculator;
 use ckb_dao_utils::DaoError;
 use ckb_error::Error;
 #[cfg(not(target_family = "wasm"))]
-use ckb_script::ChunkCommand;
+use ckb_script::{
+    Scheduler, SchedulerRunner,
+    types::{DebugPrinter, Machine},
+};
 use ckb_script::{ScriptError, TransactionScriptsVerifier};
 use ckb_traits::{
     CellDataProvider, EpochProvider, ExtensionProvider, HeaderFieldsProvider, HeaderProvider,
@@ -144,21 +147,14 @@ where
     }
 
     #[cfg(not(target_family = "wasm"))]
-    async fn resumable_verify_with_signal(
+    async fn verify_with_runner(
         &self,
         max_cycles: Cycle,
-        command_rx: &mut tokio::sync::watch::Receiver<ChunkCommand>,
-    ) -> Result<Cycle, Error> {
+        runner: &mut impl SchedulerRunner<Scheduler<DL, DebugPrinter, Machine>>,
+    ) -> Result<Option<Cycle>, Error> {
         match self.cached_cycles {
-            Some(cycles) if cycles <= max_cycles => Ok(cycles),
-            Some(_) => Err(ScriptError::ExceededMaximumCycles(max_cycles)
-                .unknown_source()
-                .into()),
-            None => {
-                self.inner
-                    .resumable_verify_with_signal(max_cycles, command_rx)
-                    .await
-            }
+            Some(_) => self.verify(max_cycles).map(Some),
+            None => self.inner.verify_with_runner(max_cycles, runner).await,
         }
     }
 }
@@ -244,22 +240,25 @@ where
         Ok(Completed { cycles, fee })
     }
 
-    /// Perform context-dependent verification with command
-    /// The verification will be interrupted when receiving a Suspend command
+    /// Verify contextual rules and cached cycles, delegating uncached VM execution.
+    /// Returns `None` if the runner stops verification.
     #[cfg(not(target_family = "wasm"))]
-    pub async fn verify_with_pause(
-        &self,
+    #[expect(
+        clippy::manual_async_fn,
+        reason = "the explicit Send bound is needed by tx-pool worker futures"
+    )]
+    pub fn verify_with_runner<'a>(
+        &'a self,
         max_cycles: Cycle,
-        command_rx: &mut tokio::sync::watch::Receiver<ChunkCommand>,
-    ) -> Result<Completed, Error> {
-        self.time_relative.verify()?;
-        self.capacity.verify()?;
-        let fee = self.fee_calculator.transaction_fee()?;
-        let cycles = self
-            .script
-            .resumable_verify_with_signal(max_cycles, command_rx)
-            .await?;
-        Ok(Completed { cycles, fee })
+        runner: &'a mut impl SchedulerRunner<Scheduler<DL, DebugPrinter, Machine>>,
+    ) -> impl std::future::Future<Output = Result<Option<Completed>, Error>> + Send + 'a {
+        async move {
+            self.time_relative.verify()?;
+            self.capacity.verify()?;
+            let fee = self.fee_calculator.transaction_fee()?;
+            let cycles = self.script.verify_with_runner(max_cycles, runner).await?;
+            Ok(cycles.map(|cycles| Completed { cycles, fee }))
+        }
     }
 }
 

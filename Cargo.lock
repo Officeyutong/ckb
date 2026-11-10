@@ -1897,12 +1897,15 @@ dependencies = [
  "ckb-types",
  "ckb-util",
  "ckb-verification",
+ "ckb-vm",
  "futures-util",
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "lru",
  "multi_index_map",
+ "nix 0.31.2",
  "rand 0.8.6",
  "rustc-hash 1.1.0",
  "sentry",
@@ -1911,6 +1914,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "winapi",
 ]
 
 [[package]]
@@ -1964,7 +1968,6 @@ dependencies = [
  "ckb-verification-traits",
  "derive_more 1.0.0",
  "lru",
- "tokio",
 ]
 
 [[package]]

@@ -6,8 +6,8 @@ mod error;
 use ckb_error::AnyError;
 use ckb_jsonrpc_types::{
     BannedAddr, Block, BlockEconomicState, BlockFilter, BlockNumber, BlockTemplate, BlockView,
-    Capacity, CellWithStatus, ChainInfo, EpochNumber, EpochView, EstimateCycles, HeaderView,
-    LocalNode, OutPoint, PoolTxDetailInfo, RawTxPool, RemoteNode, SyncState, Timestamp,
+    Capacity, CellWithStatus, ChainInfo, EntryCompleted, EpochNumber, EpochView, EstimateCycles,
+    HeaderView, LocalNode, OutPoint, PoolTxDetailInfo, RawTxPool, RemoteNode, SyncState, Timestamp,
     Transaction, TransactionAndWitnessProof, TransactionProof, TransactionWithStatusResponse,
     TxPoolInfo, Uint32, Uint64, Version,
 };
@@ -372,6 +372,7 @@ jsonrpc!(
     pub fn get_block_median_time(&self, block_hash: H256) -> Option<Timestamp>;
     pub fn estimate_cycles(&self, _tx: Transaction) -> EstimateCycles;
     pub fn send_transaction(&self, tx: Transaction, outputs_validator: Option<String>) -> H256;
+    pub fn test_tx_pool_accept(&self, tx: Transaction, outputs_validator: Option<String>) -> EntryCompleted;
     pub fn remove_transaction(&self, tx_hash: H256) -> bool;
     pub fn tx_pool_info(&self) -> TxPoolInfo;
     pub fn get_raw_tx_pool(&self, verbose: Option<bool>) -> RawTxPool;
