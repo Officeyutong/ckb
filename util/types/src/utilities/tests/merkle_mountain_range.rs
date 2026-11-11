@@ -5,7 +5,10 @@ use crate::{
     core::BlockNumber,
     packed,
     prelude::*,
-    utilities::merkle_mountain_range::{HeaderDigest as _, MergeHeaderDigest},
+    utilities::{
+        DIFF_TWO, compact_to_difficulty,
+        merkle_mountain_range::{HeaderDigest as _, MergeHeaderDigest},
+    },
 };
 
 /// Builds a digest over `[start_number, end_number]` carrying `total_difficulty`.
@@ -21,6 +24,22 @@ fn digest(
         .total_difficulty(total_difficulty)
         .start_number(start_number)
         .end_number(end_number)
+        .build()
+}
+
+/// Like [`digest`], but with a non-default compact target for both ends.
+fn digest_with_compact_target(
+    start_number: BlockNumber,
+    end_number: BlockNumber,
+    total_difficulty: U256,
+    compact_target: u32,
+) -> packed::HeaderDigest {
+    packed::HeaderDigest::new_builder()
+        .total_difficulty(total_difficulty)
+        .start_number(start_number)
+        .end_number(end_number)
+        .start_compact_target(compact_target)
+        .end_compact_target(compact_target)
         .build()
 }
 
@@ -71,4 +90,29 @@ fn test_verify_rejects_block_count_overflow() {
     let whole_range = digest(0, BlockNumber::MAX, U256::one());
 
     assert!(whole_range.verify().is_err());
+}
+
+// `block_difficulty * blocks_count` overflows when the compact target decodes
+// to `U256::MAX` and the digest claims two blocks.
+#[test]
+fn test_verify_rejects_total_difficulty_overflow() {
+    let compact_target = 0x0300_0001;
+    assert_eq!(compact_to_difficulty(compact_target), U256::max_value());
+    let two_blocks = digest_with_compact_target(1, 2, U256::zero(), compact_target);
+
+    let err = two_blocks
+        .verify()
+        .expect_err("overflowing total difficulty should be rejected");
+    assert!(err.contains("total difficulty"), "unexpected error: {err}");
+}
+
+// `start == end == u64::MAX` has a block count of one and must verify; the
+// checked arithmetic should reject only real overflow.
+#[test]
+fn test_verify_accepts_single_block_at_max_number() {
+    let difficulty = compact_to_difficulty(DIFF_TWO);
+    let digest =
+        digest_with_compact_target(BlockNumber::MAX, BlockNumber::MAX, difficulty, DIFF_TWO);
+
+    assert_eq!(digest.verify(), Ok(()));
 }
