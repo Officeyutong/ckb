@@ -6,7 +6,7 @@ use ckb_store::ChainStore;
 use ckb_types::{packed, prelude::*};
 use std::sync::Arc;
 
-use crate::{LightClientProtocol, Status, StatusCode, constant};
+use crate::{LightClientProtocol, Status, StatusCode, VerifiableHeaderParts, constant};
 
 pub(crate) struct GetBlocksProofProcess<'a> {
     message: packed::GetBlocksProofReader<'a>,
@@ -48,8 +48,7 @@ impl<'a> GetBlocksProofProcess<'a> {
                 .reply_tip_state::<packed::SendBlocksProof>(self.peer, self.nc)
                 .await;
         }
-        let last_block = snapshot
-            .get_block(&last_block_hash)
+        let last_header_parts = VerifiableHeaderParts::load(&snapshot, &last_block_hash)
             .expect("block should be in store");
 
         let block_hashes: Vec<_> = self
@@ -79,17 +78,12 @@ impl<'a> GetBlocksProofProcess<'a> {
         let mut extensions = Vec::with_capacity(found.len());
 
         for block_hash in found {
-            let block = snapshot
-                .get_block(&block_hash)
+            let parts = VerifiableHeaderParts::load(&snapshot, &block_hash)
                 .expect("block should be in store");
-            positions.push(leaf_index_to_pos(block.number()));
-            block_headers.push(block.header().data());
-            uncles_hash.push(block.calc_uncles_hash());
-            extensions.push(
-                packed::BytesOpt::new_builder()
-                    .set(block.extension())
-                    .build(),
-            );
+            positions.push(leaf_index_to_pos(parts.header.number()));
+            block_headers.push(parts.header.data());
+            uncles_hash.push(parts.uncles_hash);
+            extensions.push(packed::BytesOpt::new_builder().set(parts.extension).build());
         }
 
         let proved_items = (
@@ -103,7 +97,7 @@ impl<'a> GetBlocksProofProcess<'a> {
             .reply_proof::<packed::SendBlocksProofV1>(
                 self.peer,
                 self.nc,
-                &last_block,
+                &last_header_parts,
                 positions,
                 proved_items,
                 missing_items,
