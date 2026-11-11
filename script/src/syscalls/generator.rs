@@ -39,7 +39,9 @@ where
         ]);
     }
     if script_version == &ScriptVersion::V1 {
-        syscalls.push(Box::new(Exec::new(sg_data)));
+        syscalls.push(Box::new(
+            Exec::new(sg_data).with_validation_mode(vm_context.validation_mode),
+        ));
     }
     if script_version >= &ScriptVersion::V2 {
         syscalls.append(&mut vec![

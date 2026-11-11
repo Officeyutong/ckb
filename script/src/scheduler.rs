@@ -1030,6 +1030,7 @@ where
             base_cycles: Arc::clone(&self.total_cycles),
             message_box: Arc::clone(&self.message_box),
             snapshot2_context: Arc::new(Mutex::new(Snapshot2Context::new(self.sg_data.clone()))),
+            validation_mode: self.validation_mode,
         };
 
         let machine_builder = DefaultMachineBuilder::new(core_machine)
