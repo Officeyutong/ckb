@@ -129,6 +129,7 @@ impl Reject {
             | Self::ExceededTransactionSizeLimit(..)
             | Self::Malformed(..)
             | Self::DeclaredWrongCycles(..)
+            | Self::PoolPolicy(..)
             | Self::Resolve(..)
             | Self::Expiry(..)
             | Self::RBFRejected(..)

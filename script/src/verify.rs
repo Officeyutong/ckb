@@ -19,8 +19,6 @@ use ckb_types::{
     core::{Cycle, ScriptHashType, cell::ResolvedTransaction},
     packed::{Byte32, Script},
 };
-#[cfg(not(target_family = "wasm"))]
-use ckb_vm::machine::Pause as VMPause;
 use ckb_vm::{DefaultMachineRunner, Error as VMInternalError, ValidationMode};
 use std::sync::Arc;
 
