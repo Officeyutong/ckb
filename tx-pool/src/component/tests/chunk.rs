@@ -11,7 +11,7 @@ use ckb_db::RocksDB;
 use ckb_fee_estimator::FeeEstimator;
 use ckb_network::SessionId;
 use ckb_network::network::TransportType;
-use ckb_network::{Flags, NetworkService, NetworkState};
+use ckb_network::{Flags, NetworkService, NetworkState, PeerIndex};
 use ckb_snapshot::Snapshot;
 use ckb_store::ChainDB;
 use ckb_types::H256;
@@ -26,10 +26,37 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::sleep;
 
 const MAX_TX_VERIFY_CYCLES: u64 = 70_000_000;
+
+#[test]
+fn verify_queue_preserves_proposal_and_relay_origin() {
+    let mut queue = VerifyQueue::new(MAX_TX_VERIFY_CYCLES);
+    let local = build_tx(vec![(&H256([1; 32]).into(), 0)], 1);
+    let proposal = build_tx(vec![(&H256([2; 32]).into(), 0)], 1);
+    let relay = build_tx(vec![(&H256([3; 32]).into(), 0)], 1);
+    queue.add_tx(local.clone(), false, None).unwrap();
+    queue.add_tx(proposal.clone(), true, None).unwrap();
+    queue
+        .add_tx(relay.clone(), false, Some((1, 1.into())))
+        .unwrap();
+
+    let proposed = queue.pop_front(false).unwrap();
+    assert_eq!(proposed.tx, proposal);
+    assert!(proposed.is_proposal);
+    assert!(proposed.remote.is_none());
+    let local = queue.remove_tx_by_hash(&local.hash()).unwrap();
+    assert!(!local.is_proposal);
+    assert!(local.remote.is_none());
+    let relayed = queue.pop_front(false).unwrap();
+    assert_eq!(relayed.tx, relay);
+    assert!(!relayed.is_proposal);
+    assert_eq!(relayed.remote, Some((1, 1.into())));
+}
+
 #[tokio::test]
 async fn verify_queue_basic() {
     let tx = TransactionBuilder::default().build();
     let entry = Entry {
+        is_proposal: false,
         tx: tx.clone(),
         remote: None,
     };
@@ -247,6 +274,7 @@ async fn verify_queue_pops_proposals_by_arrival_order() {
 #[tokio::test]
 async fn verify_queue_remove() {
     let entry1 = Entry {
+        is_proposal: false,
         tx: TransactionBuilder::default()
             .set_outputs_data(vec![Default::default()])
             .build(),
@@ -255,6 +283,7 @@ async fn verify_queue_remove() {
     let entry1_id = entry1.tx.proposal_short_id();
     eprintln!("entry1_id: {:?}", entry1_id);
     let entry2 = Entry {
+        is_proposal: false,
         tx: TransactionBuilder::default()
             .set_cell_deps(vec![Default::default(), Default::default()])
             .build(),
@@ -263,6 +292,7 @@ async fn verify_queue_remove() {
     let entry2_id = entry2.tx.proposal_short_id();
     eprintln!("entry2_id: {:?}", entry2_id);
     let entry3 = Entry {
+        is_proposal: false,
         tx: TransactionBuilder::default().build(),
         remote: None,
     };
@@ -270,6 +300,7 @@ async fn verify_queue_remove() {
     eprintln!("entry3_id: {:?}", entry3_id);
 
     let entry4 = Entry {
+        is_proposal: false,
         tx: TransactionBuilder::default()
             .set_cell_deps(vec![
                 Default::default(),
@@ -477,7 +508,7 @@ async fn notify_tx_notifies_relayer_when_verify_queue_is_full() {
         .await
         .set_total_tx_size_for_test(256_000_000 - 1);
 
-    let ret = service.notify_tx(tx).await;
+    let ret = service.notify_tx(tx, None).await;
 
     assert!(matches!(ret, Err(crate::error::Reject::Full(_))));
     match tx_relay_receiver
@@ -489,4 +520,59 @@ async fn notify_tx_notifies_relayer_when_verify_queue_is_full() {
         }
         _ => panic!("expected reject notification"),
     }
+}
+
+#[tokio::test]
+async fn interrupted_relay_and_proposal_verification_releases_without_recording() {
+    let (service, receiver) = service_with_relay_receiver();
+    let snapshot = service.tx_pool.read().await.cloned_snapshot();
+    let tx = build_tx(vec![(&H256([1; 32]).into(), 0)], 1);
+    let tmp = tempfile::tempdir().unwrap();
+    service.tx_pool.write().await.recent_reject =
+        Some(crate::component::recent_reject::RecentReject::build(tmp.path(), 1, 10, -1).unwrap());
+    for reject in [
+        crate::error::Reject::ExcessiveVerifyTime,
+        crate::error::Reject::Verification(
+            ckb_script::ScriptError::Interrupts.unknown_source().into(),
+        ),
+    ] {
+        for remote in [Some((1, 1.into())), None] {
+            service
+                .after_process(tx.clone(), remote, &snapshot, &Err(reject.clone()))
+                .await;
+            assert!(matches!(
+                receiver.try_recv().expect("interrupted verification must release the known marker"),
+                TxVerificationResult::Reject { tx_hash } if tx_hash == tx.hash()
+            ));
+        }
+    }
+    assert!(receiver.try_recv().is_err(), "one completion per attempt");
+    let pool = service.tx_pool.read().await;
+    let recent = pool.recent_reject.as_ref().unwrap();
+    assert!(recent.get(&tx.hash()).unwrap().is_none());
+    assert_eq!(recent.get_estimate_total_keys_num(), 0);
+}
+
+#[tokio::test]
+async fn notify_tx_from_remote_peer_bans_its_malformed_tx_and_drops_its_queued_txs() {
+    let (service, _tx_relay_receiver) = service_with_relay_receiver();
+    let peer: PeerIndex = 1.into();
+
+    // A tx supplied by `peer` is waiting in the verify queue.
+    let queued = build_tx(vec![(&H256([2; 32]).into(), 0)], 1);
+    let queued_id = queued.proposal_short_id();
+    assert!(
+        service
+            .submit_remote_tx(queued, MAX_TX_VERIFY_CYCLES, peer)
+            .await
+            .is_ok()
+    );
+    assert!(service.verify_queue.read().await.contains_key(&queued_id));
+
+    // A malformed tx supplied by the same peer is attributed to it: the peer
+    // is penalized and its queued txs are removed.
+    let malformed = TransactionBuilder::default().build();
+    let ret = service.notify_tx(malformed, Some(peer)).await;
+    assert!(matches!(ret, Err(ref reject) if reject.is_malformed_tx()));
+    assert!(!service.verify_queue.read().await.contains_key(&queued_id));
 }

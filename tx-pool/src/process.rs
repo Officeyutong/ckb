@@ -8,8 +8,9 @@ use crate::service::{BlockAssemblerMessage, TxPoolService, TxVerificationResult}
 use crate::try_or_return_with_snapshot;
 use crate::util::{
     check_duplicate_proposal_id, check_tx_fee, is_missing_input, non_contextual_verify,
-    time_relative_verify, verify_rtx,
+    time_relative_verify,
 };
+use crate::verification::{calibration, verify_rtx};
 use ckb_error::{AnyError, InternalErrorKind};
 use ckb_fee_estimator::FeeEstimator;
 use ckb_jsonrpc_types::BlockTemplate;
@@ -397,9 +398,23 @@ impl TxPoolService {
             .await
     }
 
-    pub(crate) async fn notify_tx(&self, tx: TransactionView) -> Result<bool, Reject> {
-        self.resumeble_process_tx_and_notify_full_reject(tx, true, None)
-            .await
+    pub(crate) async fn notify_tx(
+        &self,
+        tx: TransactionView,
+        remote: Option<PeerIndex>,
+    ) -> Result<bool, Reject> {
+        let ret = self
+            .resumeble_process_tx_and_notify_full_reject(tx, true, None)
+            .await;
+        // A malformed tx is attributed to the peer that supplied it even on the
+        // proposal path, so it cannot be used to bypass the malformed-tx ban.
+        if let Err(reject) = &ret
+            && let Some(peer) = remote
+            && reject.is_malformed_tx()
+        {
+            self.ban_malformed(peer, format!("reject {reject}")).await;
+        }
+        ret
     }
 
     pub(crate) async fn test_accept_tx(&self, tx: TransactionView) -> Result<Completed, Reject> {
@@ -414,7 +429,7 @@ impl TxPoolService {
             debug!("reject tx {} already in orphan pool", tx.hash());
             return Err(Reject::Duplicated(tx.hash()));
         }
-        self._test_accept_tx(tx.clone()).await
+        self._test_accept_tx(tx).await
     }
 
     pub(crate) async fn process_tx(
@@ -430,7 +445,12 @@ impl TxPoolService {
         }
 
         if let Some((ret, snapshot)) = self
-            ._process_tx(tx.clone(), remote.map(|r| r.0), None)
+            ._process_tx(
+                tx.clone(),
+                remote.map(|r| r.0),
+                None,
+                remote.and_then(|r| calibration::time_limit(Some(r.0))),
+            )
             .await
         {
             self.after_process(tx, remote, &snapshot, &ret).await;
@@ -561,6 +581,11 @@ impl TxPoolService {
                             tx_hash,
                         });
                     }
+                    Err(reject) if reject.is_verification_interrupted() => {
+                        // Proposal deliveries have no peer metadata. Release
+                        // their known marker too so a later attempt can retry.
+                        self.send_result_to_relayer(TxVerificationResult::Reject { tx_hash });
+                    }
                     Err(reject) => {
                         debug!("after_process {} reject: {} ", tx_hash, reject);
                         if reject.should_recorded() {
@@ -641,7 +666,12 @@ impl TxPoolService {
                         }
                     }
                 } else if let Some((ret, _snapshot)) = self
-                    ._process_tx(orphan.tx.clone(), Some(orphan.cycle), None)
+                    ._process_tx(
+                        orphan.tx.clone(),
+                        Some(orphan.cycle),
+                        None,
+                        calibration::time_limit(Some(orphan.cycle)),
+                    )
                     .await
                 {
                     let orphan_hash = orphan.tx.hash();
@@ -726,6 +756,7 @@ impl TxPoolService {
         tx: TransactionView,
         declared_cycles: Option<Cycle>,
         command_rx: Option<&mut watch::Receiver<ChunkCommand>>,
+        cpu_time_limit: Option<Duration>,
     ) -> Option<(Result<Completed, Reject>, Arc<Snapshot>)> {
         let verify_cache_key = VerifyCacheKey::from(&tx);
         let instant = Instant::now();
@@ -747,6 +778,7 @@ impl TxPoolService {
             &verify_cache,
             max_cycles,
             command_rx,
+            cpu_time_limit,
         )
         .await;
 
@@ -814,6 +846,7 @@ impl TxPoolService {
             &verify_cache,
             max_cycles,
             None,
+            calibration::time_limit(None),
         )
         .await
     }
@@ -846,10 +879,12 @@ impl TxPoolService {
 
         let fetched_cache = self.fetch_txs_verify_cache(retain.iter()).await;
 
-        // If there are any transactions requires re-process, return them.
+        // Transactions the reorg detached and did not attach again are re-processed below.
         //
-        // At present, there is only one situation:
-        // - If the hardfork was happened, then re-process all transactions.
+        // Re-processing every transaction when a hardfork activates used to be the only other
+        // case. That path was removed together with the hardfork cache invalidation machinery;
+        // see `ckb_verification::cache::TxVerificationCache` for the reasoning and for the
+        // residual risk that a future semantic-changing fork has to handle.
         {
             // This closure is used to limit the lifetime of mutable tx_pool.
             let mut tx_pool = self.tx_pool.write().await;
@@ -921,6 +956,7 @@ impl TxPoolService {
                     tx_env,
                     &verify_cache,
                     max_cycles,
+                    None,
                     None,
                 )
                 .await

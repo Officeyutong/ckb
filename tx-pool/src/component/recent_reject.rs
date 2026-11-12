@@ -55,7 +55,7 @@ impl RecentReject {
     pub fn put(&mut self, hash: &Byte32, reject: Reject) -> Result<(), AnyError> {
         let hash_slice = hash.as_slice();
         let shard = self.get_shard(hash_slice).to_string();
-        let reject: ckb_jsonrpc_types::PoolTransactionReject = reject.into();
+        let reject: ckb_jsonrpc_types::PoolTransactionReject = reject.try_into()?;
         let json_string = serde_json::to_string(&reject)?;
         self.db.put(&shard, hash_slice, json_string)?;
 

@@ -9,7 +9,7 @@ use ckb_shared::Snapshot;
 use ckb_store::ChainStore;
 use ckb_types::{U256, core::BlockNumber, packed, prelude::*};
 
-use crate::{LightClientProtocol, Status, StatusCode, constant};
+use crate::{LightClientProtocol, Status, StatusCode, VerifiableHeaderParts, constant};
 
 pub(crate) struct GetLastStateProofProcess<'a> {
     message: packed::GetLastStateProofReader<'a>,
@@ -134,9 +134,7 @@ impl<'a> BlockSampler<'a> {
                 let position = leaf_index_to_pos(*number);
                 positions.push(position);
 
-                let ancestor_block = self
-                    .snapshot
-                    .get_block(&ancestor_header.hash())
+                let parts = VerifiableHeaderParts::load(self.snapshot, &ancestor_header.hash())
                     .ok_or_else(|| {
                         format!(
                             "failed to find block for header#{} (hash: {:#x})",
@@ -144,8 +142,6 @@ impl<'a> BlockSampler<'a> {
                             ancestor_header.hash()
                         )
                     })?;
-                let uncles_hash = ancestor_block.calc_uncles_hash();
-                let extension = ancestor_block.extension();
 
                 let parent_chain_root = if *number == 0 {
                     Default::default()
@@ -162,12 +158,7 @@ impl<'a> BlockSampler<'a> {
                     }
                 };
 
-                let header = packed::VerifiableHeader::new_builder()
-                    .header(ancestor_header.data())
-                    .uncles_hash(uncles_hash)
-                    .extension(Pack::pack(&extension))
-                    .parent_chain_root(parent_chain_root)
-                    .build();
+                let header = parts.to_verifiable_header(parent_chain_root);
 
                 headers.push(header);
             } else {
@@ -217,8 +208,7 @@ impl<'a> GetLastStateProofProcess<'a> {
                 .reply_tip_state::<packed::SendLastStateProof>(self.peer, self.nc)
                 .await;
         }
-        let last_block = snapshot
-            .get_block(&last_block_hash)
+        let last_header_parts = VerifiableHeaderParts::load(&snapshot, &last_block_hash)
             .expect("block should be in store");
 
         let start_block_hash = self.message.start_hash().to_entity();
@@ -231,7 +221,7 @@ impl<'a> GetLastStateProofProcess<'a> {
             .map(Into::<U256>::into)
             .collect::<Vec<_>>();
 
-        let last_block_number = last_block.number();
+        let last_block_number = last_header_parts.header.number();
         if start_block_number > last_block_number {
             return StatusCode::InvalidRequest.with_context(format!(
                 "the start block number ({start_block_number}) should not be greater than the last block number ({last_block_number})"
@@ -385,7 +375,7 @@ impl<'a> GetLastStateProofProcess<'a> {
             .reply_proof::<packed::SendLastStateProof>(
                 self.peer,
                 self.nc,
-                &last_block,
+                &last_header_parts,
                 positions,
                 proved_items,
                 (),

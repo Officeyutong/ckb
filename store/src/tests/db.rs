@@ -90,6 +90,33 @@ fn index_store() {
 }
 
 #[test]
+fn fork_epoch_data_does_not_overwrite_canonical_epoch_index() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db = RocksDB::open_in(&tmp_dir, COLUMNS);
+    let store = ChainDB::new(db, Default::default());
+    let consensus = ConsensusBuilder::default().build();
+    let epoch = consensus.genesis_epoch_ext();
+    let canonical_hash = consensus.genesis_block().hash();
+    let fork_hash = packed::Header::new_builder()
+        .nonce(1u128)
+        .build()
+        .calc_header_hash();
+    assert_ne!(canonical_hash, fork_hash);
+
+    let txn = store.begin_transaction();
+    txn.insert_canonical_epoch_ext(&canonical_hash, epoch)
+        .unwrap();
+    txn.commit().unwrap();
+
+    let txn = store.begin_transaction();
+    txn.insert_epoch_ext(&fork_hash, epoch).unwrap();
+    txn.commit().unwrap();
+
+    assert_eq!(store.get_epoch_index(epoch.number()), Some(canonical_hash));
+    assert_eq!(store.get_epoch_ext(&fork_hash), Some(epoch.clone()));
+}
+
+#[test]
 fn freeze_blockv0() {
     let tmp_dir = TempDir::new().unwrap();
     let db = RocksDB::open_in(&tmp_dir, COLUMNS);
@@ -198,6 +225,93 @@ fn freezer_get_block_keeps_hash_lookup_contract_for_same_height_side_block() {
         .expect("freeze");
 
     assert_eq!(store.get_block(&side_hash), Some(side_block));
+}
+
+#[test]
+fn freezer_get_block_header_with_uncles_and_extension_keeps_hash_lookup_contract_for_same_height_side_block()
+ {
+    let tmp_dir = TempDir::new().unwrap();
+    let db = RocksDB::open_in(&tmp_dir, COLUMNS);
+    let tmp_dir2 = TempDir::new().unwrap();
+    let freezer = Freezer::open_in(&tmp_dir2).expect("tmp freezer");
+    let store = ChainDB::new_with_freezer(db, freezer.clone(), Default::default());
+
+    let frozen_extension: packed::Bytes = [1u8; 16].into();
+    let side_extension: packed::Bytes = [2u8; 16].into();
+    let frozen_block = packed::BlockV1::new_builder()
+        .header(
+            packed::Header::new_builder()
+                .raw(packed::RawHeader::new_builder().number(1u64).build())
+                .nonce(1u128)
+                .build(),
+        )
+        .uncles(vec![
+            packed::UncleBlock::new_builder()
+                .header(
+                    packed::Header::new_builder()
+                        .raw(packed::RawHeader::new_builder().number(0u64).build())
+                        .nonce(3u128)
+                        .build(),
+                )
+                .build(),
+        ])
+        .extension(frozen_extension)
+        .build()
+        .as_v0()
+        .into_view();
+    let side_block = packed::BlockV1::new_builder()
+        .header(
+            packed::Header::new_builder()
+                .raw(packed::RawHeader::new_builder().number(1u64).build())
+                .nonce(2u128)
+                .build(),
+        )
+        .uncles(vec![
+            packed::UncleBlock::new_builder()
+                .header(
+                    packed::Header::new_builder()
+                        .raw(packed::RawHeader::new_builder().number(0u64).build())
+                        .nonce(4u128)
+                        .build(),
+                )
+                .build(),
+        ])
+        .extension(side_extension)
+        .build()
+        .as_v0()
+        .into_view();
+    let side_hash = side_block.hash();
+    assert_ne!(frozen_block.hash(), side_hash);
+    assert_ne!(
+        frozen_block.calc_uncles_hash(),
+        side_block.calc_uncles_hash()
+    );
+
+    let txn = store.begin_transaction();
+    txn.insert_block(&frozen_block).unwrap();
+    txn.insert_block(&side_block).unwrap();
+    txn.commit().unwrap();
+
+    freezer
+        .freeze(2, |_number| Some(frozen_block.clone()))
+        .expect("freeze");
+
+    assert_eq!(
+        store.get_block_header_with_uncles_and_extension(&frozen_block.hash()),
+        Some((
+            frozen_block.header(),
+            frozen_block.calc_uncles_hash(),
+            frozen_block.extension(),
+        ))
+    );
+    assert_eq!(
+        store.get_block_header_with_uncles_and_extension(&side_hash),
+        Some((
+            side_block.header(),
+            side_block.calc_uncles_hash(),
+            side_block.extension(),
+        ))
+    );
 }
 
 #[test]

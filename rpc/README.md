@@ -4534,7 +4534,15 @@ Response
 * result: [`EntryCompleted`](#type-entrycompleted)
 
 Test if a transaction can be accepted by the transaction pool without inserting it into the pool or rebroadcasting it to peers.
-The parameters and errors of this method are the same as `send_transaction`.
+The parameters are the same as `send_transaction`.
+
+Script execution also has a local CPU budget, shared across script groups.
+Exhausting it returns `PoolRejectedTransactionByVerifyTimeLimit (-1113)`;
+this does not imply that the transaction is invalid or record it as rejected.
+The budget excludes queueing and time spent suspended or descheduled. It
+uses the same fixed CPU cap as a network transaction without declared cycles.
+If this platform has no usable thread CPU clock, only the existing cycle
+limit applies. `send_transaction` and block verification keep their cycle rules.
 
 ###### Params
 
@@ -4548,6 +4556,7 @@ The parameters and errors of this method are the same as `send_transaction`.
 * [`PoolRejectedTransactionByMaxAncestorsCountLimit (-1105)`](../enum.RPCError.html#variant.PoolRejectedTransactionByMaxAncestorsCountLimit) - The ancestors count must be greater than or equal to the config option `tx_pool.max_ancestors_count`.
 * [`PoolIsFull (-1106)`](../enum.RPCError.html#variant.PoolIsFull) - Pool is full.
 * [`PoolRejectedDuplicatedTransaction (-1107)`](../enum.RPCError.html#variant.PoolRejectedDuplicatedTransaction) - The transaction is already in the pool.
+* [`PoolRejectedTransactionByVerifyTimeLimit (-1113)`](../enum.RPCError.html#variant.PoolRejectedTransactionByVerifyTimeLimit) - The local VM CPU budget was exhausted. The request may be retried.
 * [`TransactionFailedToResolve (-301)`](../enum.RPCError.html#variant.TransactionFailedToResolve) - Failed to resolve the referenced cells and headers used in the transaction, as inputs or dependencies.
 * [`TransactionFailedToVerify (-302)`](../enum.RPCError.html#variant.TransactionFailedToVerify) - Failed to verify the transaction.
 
@@ -6978,7 +6987,7 @@ An enum value from one of:
   - `LowFeeRate` :  Transaction fee lower than config
   - `ExceededMaximumAncestorsCount` :  Transaction exceeded maximum ancestors count limit
   - `ExceededTransactionSizeLimit` :  Transaction exceeded maximum size limit
-  - `Full` :  Transactions are replaced because the pool is full
+  - `Full` :  The transaction pool is full
   - `Duplicated` :  Transaction already exists in transaction_pool
   - `Malformed` :  Malformed transaction
   - `DeclaredWrongCycles` :  Declared wrong cycles
@@ -8015,5 +8024,9 @@ For example, a cellbase transaction is not allowed in `send_transaction` RPC.
 (-1111): The transaction is rejected for RBF checking.
 ### ERROR `PoolRejectedInvalidated`
 (-1112): The transaction is rejected for ref cell consuming.
+### ERROR `PoolRejectedTransactionByVerifyTimeLimit`
+(-1113): `test_tx_pool_accept` exceeded this node's CKB-VM CPU budget.
+
+This is a retryable resource limit and does not imply consensus invalidity.
 ### ERROR `Indexer`
 (-1200): The indexer error.

@@ -30,6 +30,7 @@ use ckb_chain_spec::ChainSpec;
 pub struct Setup {
     pub num_nodes: usize,
     pub retry_failed: usize,
+    pub env: Vec<(&'static str, &'static str)>,
 }
 
 pub trait Spec: Send {
@@ -42,7 +43,8 @@ pub trait Spec: Send {
     }
 
     fn before_run(&self) -> Vec<Node> {
-        let mut nodes = (0..self.setup().num_nodes)
+        let setup = self.setup();
+        let mut nodes = (0..setup.num_nodes)
             .map(|i| Node::new(self.name(), &format!("node{i}")))
             .collect::<Vec<_>>();
         nodes
@@ -51,7 +53,9 @@ pub trait Spec: Send {
         nodes
             .iter_mut()
             .for_each(|node| node.modify_chain_spec(|spec| self.modify_chain_spec(spec)));
-        nodes.iter_mut().for_each(|node| node.start());
+        nodes
+            .iter_mut()
+            .for_each(|node| node.start_with_env(&setup.env));
         nodes
     }
 
@@ -72,6 +76,7 @@ impl Default for Setup {
         Setup {
             num_nodes: 1,
             retry_failed: 0,
+            env: Vec::new(),
         }
     }
 }

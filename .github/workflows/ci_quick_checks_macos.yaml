@@ -44,6 +44,11 @@ jobs:
       - name: Run cargo check
         run: cargo check --locked --workspace --all-targets --features deadlock_detection,with_sentry,portable
         shell: bash
+      - name: Install nextest-rs/nextest
+        uses: taiki-e/install-action@nextest
+      - name: Test VM CPU budgets and pause controls
+        run: cargo nextest run --locked -p ckb-tx-pool --lib --features portable -E 'test(verification::)' --test-threads 2 --retries 0
+        shell: bash
       - name: Run quick checks
         run: |
           brew unlink yq

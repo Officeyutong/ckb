@@ -6,6 +6,7 @@ mod late_parent_capacity;
 mod links;
 mod orphan;
 mod pending;
+mod proposal_ancestors;
 mod proposed;
 mod recent_reject;
 mod relations;

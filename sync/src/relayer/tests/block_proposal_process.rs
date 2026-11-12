@@ -28,7 +28,7 @@ fn test_no_unknown() {
         .enable_all()
         .build()
         .unwrap();
-    let process = BlockProposalProcess::new(content.as_reader(), &relayer);
+    let process = BlockProposalProcess::new(content.as_reader(), &relayer, 1.into());
     assert_eq!(rt.block_on(process.execute()), Status::ignored());
 }
 
@@ -52,7 +52,7 @@ fn test_no_asked() {
         .enable_all()
         .build()
         .unwrap();
-    let process = BlockProposalProcess::new(content.as_reader(), &relayer);
+    let process = BlockProposalProcess::new(content.as_reader(), &relayer, 1.into());
     assert_eq!(rt.block_on(process.execute()), Status::ignored());
 
     let known = relayer.shared.state().already_known_tx(&transaction.hash());
@@ -90,7 +90,7 @@ fn test_ok() {
         .enable_all()
         .build()
         .unwrap();
-    let process = BlockProposalProcess::new(content.as_reader(), &relayer);
+    let process = BlockProposalProcess::new(content.as_reader(), &relayer, 1.into());
     assert_eq!(rt.block_on(process.execute()), Status::ok());
 
     let known = relayer.shared.state().already_known_tx(&transaction.hash());
@@ -128,6 +128,6 @@ fn test_clear_expired_inflight_proposals() {
         .enable_all()
         .build()
         .unwrap();
-    let process = BlockProposalProcess::new(content.as_reader(), &relayer);
+    let process = BlockProposalProcess::new(content.as_reader(), &relayer, 1.into());
     assert_eq!(rt.block_on(process.execute()), Status::ignored());
 }

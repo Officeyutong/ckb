@@ -2,6 +2,7 @@ use crate::relayer::compact_block_process::CompactBlockProcess;
 use crate::relayer::tests::helper::{
     MockProtocolContext, build_chain, gen_block, new_header_builder,
 };
+use crate::types::PendingCompactBlock;
 use crate::{Status, StatusCode};
 use ckb_chain::ChainServiceScope;
 use ckb_network::{PeerIndex, SupportProtocols};
@@ -498,7 +499,7 @@ fn test_compact_block_accepts_parent_from_header_map() {
 }
 
 #[test]
-fn test_invalid_compact_target_with_parent_from_header_map_does_not_enter_pending() {
+fn test_epoch_mismatch_with_parent_from_header_map_is_temporary() {
     let (_chain, relayer, _) = build_chain(20);
     let header_map_parent = new_non_tail_header_map_parent(&relayer);
     let child_epoch = child_epoch_after(header_map_parent.epoch());
@@ -559,14 +560,14 @@ fn test_invalid_compact_target_with_parent_from_header_map_does_not_enter_pendin
 
     assert_eq!(
         rt.block_on(compact_block_process.execute()),
-        StatusCode::CompactBlockHasInvalidHeader.into()
+        StatusCode::CompactBlockRequiresParent.into()
     );
     assert_eq!(
         relayer
             .shared()
             .active_chain()
             .get_block_status(&block_hash),
-        BlockStatus::BLOCK_INVALID
+        BlockStatus::UNKNOWN
     );
 
     let pending_compact_blocks = rt.block_on(relayer.shared.state().pending_compact_blocks());
@@ -784,8 +785,14 @@ fn test_accept_block() {
         pending_compact_blocks.insert(
             mock_block_1.header().hash(),
             (
-                mock_compact_block_1,
-                HashMap::from_iter(vec![(1.into(), (vec![1], vec![0]))]),
+                HashMap::from_iter(vec![(
+                    1.into(),
+                    PendingCompactBlock {
+                        compact_block: mock_compact_block_1,
+                        missing_transactions: vec![1],
+                        missing_uncles: vec![0],
+                    },
+                )]),
                 ckb_systemtime::unix_time_as_millis(),
             ),
         );
@@ -793,8 +800,14 @@ fn test_accept_block() {
         pending_compact_blocks.insert(
             mock_block_2.header().hash(),
             (
-                mock_compact_block_2,
-                HashMap::from_iter(vec![(1.into(), (vec![1], vec![0]))]),
+                HashMap::from_iter(vec![(
+                    1.into(),
+                    PendingCompactBlock {
+                        compact_block: mock_compact_block_2,
+                        missing_transactions: vec![1],
+                        missing_uncles: vec![0],
+                    },
+                )]),
                 ckb_systemtime::unix_time_as_millis(),
             ),
         );

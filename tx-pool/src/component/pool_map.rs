@@ -507,19 +507,110 @@ impl PoolMap {
         min_fee_rate
     }
 
-    // find the pending txs sorted by score, and return their proposal short ids
+    /// Returns at most `limit` proposal short ids for the next block.
+    ///
+    /// A candidate is proposed together with the ancestors that still need a proposal, so a
+    /// descendant never takes a slot while an ancestor is still `Pending` and therefore
+    /// uncommittable. When a candidate's whole closure does not fit into the remaining slots,
+    /// those slots are filled with the root-first prefix of the closure instead, so long chains
+    /// keep advancing instead of leaving the proposal area half empty.
     pub(crate) fn get_proposals(
         &self,
         limit: usize,
         exclusion: &HashSet<ProposalShortId>,
     ) -> HashSet<ProposalShortId> {
-        self.score_sorted_iter_by_status(Status::Pending)
-            .filter_map(|entry| {
-                let id = entry.proposal_short_id();
-                (!exclusion.contains(&id)).then_some(id)
-            })
-            .take(limit)
-            .collect()
+        let mut proposals: HashSet<ProposalShortId> = HashSet::with_capacity(limit);
+        let mut settled: HashSet<ProposalShortId> = HashSet::new();
+        for entry in self.score_sorted_iter_by_status(Status::Pending) {
+            if proposals.len() >= limit {
+                break;
+            }
+            let id = entry.proposal_short_id();
+            if proposals.contains(&id) {
+                continue;
+            }
+            // An id an uncle already proposed needs no slot of its own, but its ancestors do.
+            let needs_slot = !exclusion.contains(&id);
+            let ancestors = self.unproposed_ancestors(&id, &proposals, &mut settled, exclusion);
+            let needed = ancestors.len() + usize::from(needs_slot);
+            let remaining = limit - proposals.len();
+            if needed <= remaining {
+                if needs_slot {
+                    proposals.insert(id);
+                }
+                proposals.extend(ancestors);
+            } else {
+                proposals.extend(ancestors.into_iter().take(remaining));
+            }
+        }
+        proposals
+    }
+
+    /// Collects the ancestors of `id` that still need a proposal, ordered so that every
+    /// ancestor comes before its descendants.
+    ///
+    /// `Proposed` and `Gap` entries already appeared in a recent block, and an id listed by an
+    /// uncle is proposed by that uncle, so none of them is collected. The walk still continues
+    /// through them, because an ancestor further up the chain can be `Pending` again.
+    ///
+    /// `chosen` and `settled` memoise work across the candidates of one call. A `chosen` id is
+    /// already part of the proposal set and its whole closure is in that set; a `settled` id is
+    /// covered together with all of its ancestors. Stopping at either one keeps a pool that
+    /// shares ancestors across many candidates linear instead of walking each closure anew.
+    fn unproposed_ancestors(
+        &self,
+        id: &ProposalShortId,
+        chosen: &HashSet<ProposalShortId>,
+        settled: &mut HashSet<ProposalShortId>,
+        exclusion: &HashSet<ProposalShortId>,
+    ) -> Vec<ProposalShortId> {
+        let mut ordered: Vec<ProposalShortId> = Vec::new();
+        let mut visited: HashSet<ProposalShortId> = HashSet::new();
+        // `true` marks the post-order visit that emits the id after its parents.
+        let mut stack: Vec<(ProposalShortId, bool)> = Vec::new();
+        if let Some(parents) = self.links.get_parents(id) {
+            stack.extend(parents.iter().map(|parent| (parent.clone(), false)));
+        }
+        while let Some((current, expanded)) = stack.pop() {
+            if expanded {
+                if self.requires_proposal(&current, exclusion) {
+                    ordered.push(current);
+                } else if self.links.get_parents(&current).is_none_or(|parents| {
+                    parents
+                        .iter()
+                        .all(|parent| chosen.contains(parent) || settled.contains(parent))
+                }) {
+                    settled.insert(current);
+                }
+                continue;
+            }
+            if chosen.contains(&current)
+                || settled.contains(&current)
+                || !visited.insert(current.clone())
+            {
+                continue;
+            }
+            stack.push((current.clone(), true));
+            if let Some(parents) = self.links.get_parents(&current) {
+                stack.extend(parents.iter().map(|parent| (parent.clone(), false)));
+            }
+        }
+        ordered
+    }
+
+    /// Whether `id` still needs a proposal of its own.
+    ///
+    /// `Proposed` and `Gap` both mean the transaction already appears in the proposal section
+    /// of a recent block; `Gap` only adds that it cannot be committed yet.
+    fn requires_proposal(
+        &self,
+        id: &ProposalShortId,
+        exclusion: &HashSet<ProposalShortId>,
+    ) -> bool {
+        !exclusion.contains(id)
+            && self
+                .get_by_id(id)
+                .is_some_and(|entry| entry.status == Status::Pending)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = &PoolEntry> {

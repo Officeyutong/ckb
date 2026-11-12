@@ -285,3 +285,48 @@ fn open_files_limit_retrieve() {
         assert_eq!(Some(expect), actual);
     }
 }
+
+#[test]
+fn append_after_retrieve_from_head_file() {
+    let tempdir = tempfile::Builder::new().tempdir().unwrap();
+
+    // Large enough to keep every item in the head file
+    let mut freezer = FreezerFilesBuilder::new(tempdir.path().to_path_buf())
+        .max_file_size(1_000)
+        .build()
+        .unwrap();
+    freezer.preopen().unwrap();
+
+    for i in 1..6 {
+        freezer.append(i.into(), &make_bytes(15, i)).unwrap();
+    }
+
+    // Reading an item of the head file moves the offset of the shared head file handle
+    assert_eq!(freezer.retrieve(2).unwrap(), Some(make_bytes(15, 2)));
+    freezer.append(6, &make_bytes(15, 6)).unwrap();
+
+    for i in 1..7 {
+        assert_eq!(
+            freezer.retrieve(i.into()).unwrap(),
+            Some(make_bytes(15, i)),
+            "item {i}"
+        );
+    }
+
+    // Also after the head file is reopened
+    drop(freezer);
+    let mut freezer = FreezerFilesBuilder::new(tempdir.path().to_path_buf())
+        .max_file_size(1_000)
+        .build()
+        .unwrap();
+    freezer.preopen().unwrap();
+    assert_eq!(freezer.retrieve(3).unwrap(), Some(make_bytes(15, 3)));
+    freezer.append(7, &make_bytes(15, 7)).unwrap();
+    for i in 1..8 {
+        assert_eq!(
+            freezer.retrieve(i.into()).unwrap(),
+            Some(make_bytes(15, i)),
+            "item {i} after reopen"
+        );
+    }
+}

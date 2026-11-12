@@ -407,109 +407,20 @@ async fn check_spawn_async() {
     let result = verifier.verify_without_pause(script_version, &rtx, Cycle::MAX);
     let cycles_once = result.unwrap();
 
-    // we use debug pause to test context resume
-    // `current_cycles_with_snapshot` will try to pause verifier
-    // here we use `channel` to send Resume to verifier until it completes
-    let (command_tx, mut command_rx) = watch::channel(ChunkCommand::Resume);
-    let _jt = tokio::spawn(async move {
-        loop {
-            let res = command_tx.send(ChunkCommand::Resume);
-            if res.is_err() {
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-        }
-    });
+    // The debug syscall pauses the spawned VM; resuming must preserve cycles.
     let cycles = verifier
-        .verify_complete_async(script_version, &rtx, &mut command_rx, false, None)
+        .verify_with_runner(script_version, &rtx, cycles_once)
         .await
         .unwrap();
     assert_eq!(cycles, cycles_once);
-
-    // we send Resume/Suspend to command_rx in a loop, make sure cycles is still the same
-    let (command_tx, mut command_rx) = watch::channel(ChunkCommand::Resume);
-    let _jt = tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            let _res = command_tx.send(ChunkCommand::Suspend);
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-            let _res = command_tx.send(ChunkCommand::Resume);
-            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-
-            let _res = command_tx.send(ChunkCommand::Suspend);
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
-            let _res = command_tx.send(ChunkCommand::Resume);
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-    });
-
-    let cycles = verifier
-        .verify_complete_async(script_version, &rtx, &mut command_rx, true, None)
+    let error = verifier
+        .verify_with_runner(script_version, &rtx, cycles_once - 1)
         .await
-        .unwrap();
-    assert_eq!(cycles, cycles_once);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn check_spawn_suspend_shutdown() {
-    let script_version = SCRIPT_VERSION;
-    if script_version <= ScriptVersion::V1 {
-        return;
-    }
-
-    let (spawn_caller_cell, spawn_caller_data_hash) =
-        load_cell_from_path("testdata/spawn_caller_exec");
-    let (snapshot_cell, _) = load_cell_from_path("testdata/infinite_loop");
-
-    let spawn_caller_script = Script::new_builder()
-        .hash_type(script_version.data_hash_type())
-        .code_hash(spawn_caller_data_hash)
-        .build();
-    let output = CellOutputBuilder::default()
-        .capacity(capacity_bytes!(100))
-        .lock(spawn_caller_script)
-        .build();
-    let input = CellInput::new(OutPoint::null(), 0);
-
-    let transaction = TransactionBuilder::default().input(input).build();
-    let dummy_cell = create_dummy_cell(output);
-
-    let rtx = ResolvedTransaction {
-        transaction,
-        resolved_cell_deps: vec![spawn_caller_cell, snapshot_cell],
-        resolved_inputs: vec![dummy_cell],
-        resolved_dep_groups: vec![],
-    };
-
-    let verifier = TransactionScriptsVerifierWithEnv::new();
-    let (command_tx, mut command_rx) = watch::channel(ChunkCommand::Resume);
-    let _jt = tokio::spawn(async move {
-        loop {
-            let _res = command_tx.send(ChunkCommand::Suspend);
-            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-
-            let _res = command_tx.send(ChunkCommand::Resume);
-            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-
-            let _res = command_tx.send(ChunkCommand::Suspend);
-            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-
-            let _res = command_tx.send(ChunkCommand::Stop);
-            tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
-        }
-    });
-
-    let res = verifier
-        .verify_complete_async(script_version, &rtx, &mut command_rx, true, None)
-        .await;
-    assert!(res.is_err());
-    let err = res.unwrap_err();
-    assert!(err.to_string().contains("VM Interrupts"));
-
-    let reject = ckb_types::core::tx_pool::Reject::Verification(err);
-    assert!(!reject.is_malformed_tx());
+        .unwrap_err();
+    let expected: Error = ScriptError::ExceededMaximumCycles(cycles_once - 1)
+        .input_lock_script(0)
+        .into();
+    ckb_error::assert_error_eq!(error, expected);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -544,17 +455,8 @@ async fn check_run_vm_with_pause_and_max_cycles() {
     };
 
     let verifier = TransactionScriptsVerifierWithEnv::new();
-    let (command_tx, mut command_rx) = watch::channel(ChunkCommand::Resume);
-
-    let _jt = tokio::spawn(async move {
-        loop {
-            let _res = command_tx.send(ChunkCommand::Resume);
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-    });
-
     let res = verifier
-        .verify_complete_async(script_version, &rtx, &mut command_rx, true, Some(10000))
+        .verify_with_runner(script_version, &rtx, 10_000)
         .await;
 
     let err = res.unwrap_err();
@@ -1469,4 +1371,62 @@ fn spawn_create_17_spawn() {
         .expect("verify");
 
     assert_eq!(cycles, 36445673);
+
+    // Interrupt at observable guest events, without relying on thread timing.
+    // This program swaps VMs during IO and prints current_cycles, so comparing
+    // the entire trace checks the historical syscall values as well as the total.
+    let run = |max_cycles: Cycle, interrupt: bool| {
+        verifier.verify_map(script_version, &rtx, |mut verifier| {
+            let pause = ckb_vm::machine::Pause::new();
+            let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let output = Arc::clone(&messages);
+            let signal = pause.clone();
+            verifier.syscall_context.debug_printer = Arc::new(move |_, message| {
+                output.lock().unwrap().push(message.to_owned());
+                if interrupt {
+                    signal.interrupt();
+                }
+            });
+            let (_, group) = verifier.groups().next().unwrap();
+            let mut scheduler = verifier.create_scheduler(group).unwrap();
+            if interrupt {
+                pause.interrupt();
+            }
+            let mut pauses = 0;
+            let result = loop {
+                let remaining = max_cycles
+                    .checked_sub(scheduler.consumed_cycles())
+                    .expect("a paused scheduler must stay within the total cap");
+                match scheduler.run(crate::RunMode::Pause(pause.clone(), remaining)) {
+                    Err(ckb_vm::Error::Pause) => pauses += 1,
+                    result => break result,
+                }
+            };
+            let messages = messages.lock().unwrap().clone();
+            (result, messages, pauses)
+        })
+    };
+
+    let (expected, expected_messages, pauses) = run(cycles, false);
+    let expected = expected.unwrap();
+    assert_eq!(expected.exit_code, 0);
+    assert_eq!(expected.consumed_cycles, cycles);
+    assert_eq!(pauses, 0);
+    for max_cycles in [u64::MAX, 0, cycles - 1, cycles] {
+        let (actual, messages, pauses) = run(max_cycles, true);
+        if max_cycles < cycles {
+            assert_eq!(actual.unwrap_err(), ckb_vm::Error::CyclesExceeded);
+        } else {
+            let actual = actual.unwrap();
+            assert_eq!(actual.exit_code, expected.exit_code);
+            assert_eq!(messages.len(), expected_messages.len());
+            for (index, (actual, expected)) in messages.iter().zip(&expected_messages).enumerate() {
+                assert_eq!(actual, expected, "guest trace differs at message {index}");
+            }
+            assert_eq!(actual.consumed_cycles, expected.consumed_cycles);
+        }
+        if max_cycles > 0 {
+            assert!(pauses > 1, "must interrupt running guest code repeatedly");
+        }
+    }
 }

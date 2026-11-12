@@ -120,7 +120,7 @@ pub(crate) enum Message {
     RemoveLocalTx(Request<Byte32, bool>),
     TestAcceptTx(Request<TransactionView, TestAcceptTxResult>),
     SubmitRemoteTx(Request<(TransactionView, Cycle, PeerIndex), ()>),
-    NotifyTxs(Notify<Vec<TransactionView>>),
+    NotifyTxs(Notify<(Vec<TransactionView>, Option<PeerIndex>)>),
     FreshProposalsFilter(AsyncRequest<Vec<ProposalShortId>, Vec<ProposalShortId>>),
     FetchTxs(AsyncRequest<HashSet<ProposalShortId>, HashMap<ProposalShortId, TransactionView>>),
     FetchTxsWithCycles(AsyncRequest<HashSet<Byte32>, FetchTxsWithCyclesResult>),
@@ -201,13 +201,13 @@ macro_rules! send_notify {
 impl TxPoolController {
     /// Return whether tx-pool service is started
     pub fn service_started(&self) -> bool {
-        self.started.load(Ordering::Acquire)
+        self.started.load(Ordering::SeqCst)
     }
 
     /// Set tx-pool service started, should only used for test
     #[cfg(feature = "internal")]
     pub fn set_service_started(&self, v: bool) {
-        self.started.store(v, Ordering::Release);
+        self.started.store(v, Ordering::SeqCst);
     }
 
     /// Return reference of tokio runtime handle
@@ -284,14 +284,21 @@ impl TxPoolController {
         send_message!(self, SubmitRemoteTx, (tx, declared_cycles, peer))
     }
 
-    /// Receive txs from network, try to add txs to tx-pool
-    pub fn notify_txs(&self, txs: Vec<TransactionView>) -> Result<(), AnyError> {
-        send_notify!(self, NotifyTxs, txs)
+    /// Receive locally generated txs (no peer attribution), try to add txs to
+    /// tx-pool
+    pub fn notify_local_txs(&self, txs: Vec<TransactionView>) -> Result<(), AnyError> {
+        send_notify!(self, NotifyTxs, (txs, None))
     }
 
-    /// Receive txs from network, try to add txs to tx-pool
-    pub async fn notify_txs_async(&self, txs: Vec<TransactionView>) -> Result<(), AnyError> {
-        let notify = Notify::new(txs);
+    /// Receive txs from a remote peer, try to add txs to tx-pool
+    ///
+    /// The peer is carried so malformed transactions can be attributed to it.
+    pub async fn notify_remote_txs_async(
+        &self,
+        txs: Vec<TransactionView>,
+        peer: PeerIndex,
+    ) -> Result<(), AnyError> {
+        let notify = Notify::new((txs, Some(peer)));
         self.sender
             .try_send(Message::NotifyTxs(notify))
             .map_err(|e| {
@@ -584,6 +591,7 @@ impl TxPoolServiceBuilder {
 
     /// Start a background thread tx-pool service by taking ownership of the Builder, and returns a TxPoolController.
     pub fn start(self, network: NetworkController) {
+        crate::verification::calibration::initialize();
         let consensus = self.snapshot.cloned_consensus();
 
         let verify_queue = Arc::new(RwLock::new(VerifyQueue::new(
@@ -742,7 +750,7 @@ impl TxPoolServiceBuilder {
                 }
             }
         });
-        self.started.store(true, Ordering::Release);
+        self.started.store(true, Ordering::SeqCst);
         if let Err(err) = self.tx_pool_controller.load_persisted_data(txs) {
             error!("Failed to import persistent txs, cause: {}", err);
         }
@@ -863,9 +871,11 @@ async fn process(mut service: TxPoolService, message: Message) {
                 error!("Responder sending submit_tx result failed {:?}", e);
             };
         }
-        Message::NotifyTxs(Notify { arguments: txs }) => {
+        Message::NotifyTxs(Notify {
+            arguments: (txs, remote),
+        }) => {
             for tx in txs {
-                let _ret = service.notify_tx(tx).await;
+                let _ret = service.notify_tx(tx, remote).await;
             }
         }
         Message::FreshProposalsFilter(AsyncRequest {
