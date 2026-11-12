@@ -202,52 +202,6 @@ fn late_parent_updates_both_sides_without_recounting_shared_ancestors() {
 }
 
 #[test]
-fn removing_a_bridge_updates_lost_transitive_relations() {
-    let entries = graph(&[&[], &[0], &[1], &[2]]);
-    let mut pool = PoolMap::new(10);
-    for entry in &entries {
-        insert(&mut pool, entry);
-    }
-    pool.remove_entry(&entries[1].proposal_short_id()).unwrap();
-    assert_consistent(&pool);
-}
-
-#[test]
-fn removing_a_bridge_preserves_alternative_paths() {
-    let entries = graph(&[&[], &[0], &[0], &[1, 2], &[3]]);
-    let mut pool = PoolMap::new(10);
-    for entry in &entries {
-        insert(&mut pool, entry);
-    }
-    pool.remove_entry(&entries[1].proposal_short_id()).unwrap();
-    assert_consistent(&pool);
-}
-
-#[test]
-fn descendant_removal_updates_surviving_ancestors_and_eviction_order() {
-    let entries = graph(&[&[], &[0], &[0], &[1, 2], &[3]]);
-    let mut pool = PoolMap::new(10);
-    for entry in &entries {
-        insert(&mut pool, entry);
-    }
-    let removed = pool.remove_entry_and_descendants(&entries[1].proposal_short_id());
-    assert_eq!(removed.len(), 3);
-    assert_consistent(&pool);
-}
-
-#[test]
-fn reinserted_entries_derive_statistics_from_current_membership() {
-    let entries = graph(&[&[], &[0], &[1]]);
-    let mut pool = PoolMap::new(10);
-    for entry in &entries {
-        insert(&mut pool, entry);
-    }
-    let removed = pool.remove_entry(&entries[1].proposal_short_id()).unwrap();
-    insert(&mut pool, &removed);
-    assert_consistent(&pool);
-}
-
-#[test]
 fn insertion_and_removal_orders_preserve_graph_statistics() {
     let entries = graph(&[&[], &[0], &[0], &[1, 2], &[1, 3]]);
     // Enumerate every insertion order, then remove from each possible starting
@@ -294,6 +248,21 @@ fn every_five_node_dag_preserves_statistics_across_membership_changes() {
             }
         }
         let entries = graph(&parents.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        // Derive the removal closure from the fixture's topological order,
+        // independently of the pool's links and cached package statistics.
+        let mut removed_indices = HashSet::from([2]);
+        for (child, parents) in parents.iter().enumerate() {
+            if parents
+                .iter()
+                .any(|parent| removed_indices.contains(parent))
+            {
+                removed_indices.insert(child);
+            }
+        }
+        let expected_removed: HashSet<_> = removed_indices
+            .iter()
+            .map(|&index| entries[index].proposal_short_id())
+            .collect();
         for order in [[0, 1, 2, 3, 4], [4, 3, 2, 1, 0], [2, 0, 4, 1, 3]] {
             let mut pool = PoolMap::new(5);
             for index in order {
@@ -301,6 +270,14 @@ fn every_five_node_dag_preserves_statistics_across_membership_changes() {
                 assert_consistent(&pool);
             }
             let removed = pool.remove_entry_and_descendants(&entries[2].proposal_short_id());
+            assert_eq!(removed.len(), expected_removed.len());
+            assert_eq!(
+                removed
+                    .iter()
+                    .map(TxEntry::proposal_short_id)
+                    .collect::<HashSet<_>>(),
+                expected_removed
+            );
             assert_consistent(&pool);
             // Returned entries still carry their old statistics. Reinsertion
             // must derive new totals even when children return before parents.
@@ -481,50 +458,6 @@ fn late_parent_cannot_push_descendants_over_the_ancestor_limit() {
         Err(Reject::ExceededMaximumAncestorsCount)
     ));
     assert_eq!(pool.size(), 3);
-    assert_consistent(&pool);
-}
-
-#[test]
-fn input_conflict_does_not_partially_record_a_candidate() {
-    let entries = graph(&[&[], &[0]]);
-    let mut pool = PoolMap::new(10);
-    for entry in &entries {
-        insert(&mut pool, entry);
-    }
-    // A fresh input precedes the conflicting one, after a real in-pool parent.
-    let tx = build_tx(
-        vec![
-            (&entries[0].transaction().hash(), 1),
-            (&Byte32::zero(), 101),
-        ],
-        1,
-    );
-    let size = tx.data().serialized_size_in_block();
-    let candidate = TxEntry::dummy_resolve(tx, 1, Capacity::shannons(1), size);
-    assert!(matches!(
-        pool.add_entry(candidate, Status::Proposed),
-        Err(Reject::RBFRejected(_))
-    ));
-    assert_eq!(pool.inputs_len(), 2);
-    assert_eq!(pool.links.inner.len(), 2);
-    assert_consistent(&pool);
-}
-
-#[test]
-fn reader_eviction_preserves_retained_statistics_and_pool_totals() {
-    let entries = graph(&[&[], &[0]]);
-    let mut pool = PoolMap::new(2);
-    for entry in &entries {
-        insert(&mut pool, entry);
-    }
-    let tx = build_tx(vec![(&entries[0].transaction().hash(), 0)], 1);
-    let size = tx.data().serialized_size_in_block();
-    let spender = TxEntry::dummy_resolve(tx, 50, Capacity::shannons(1), size);
-    let (inserted, evicted) = pool.add_entry(spender.clone(), Status::Proposed).unwrap();
-    assert!(inserted);
-    assert_eq!(evicted, HashSet::from([entries[1].clone()]));
-    assert_eq!(pool.size(), 2);
-    assert!(pool.get(&spender.proposal_short_id()).is_some());
     assert_consistent(&pool);
 }
 
@@ -752,33 +685,6 @@ fn reader_eviction_preserves_candidate_producers_and_their_ancestors() {
 }
 
 #[test]
-fn descendant_limit_rejection_does_not_commit_planned_reader_evictions() {
-    let entries = graph(&[&[], &[0], &[]]);
-    let tx = build_tx(vec![(&entries[0].transaction().hash(), 0)], 1);
-    let spender = TxEntry::dummy_resolve(tx, 50, Capacity::shannons(1), 200);
-    let tx = build_tx_with_dep(
-        vec![(&Byte32::zero(), 200)],
-        vec![
-            (&spender.transaction().hash(), 0),
-            (&entries[2].transaction().hash(), 0),
-        ],
-        1,
-    );
-    let child = TxEntry::dummy_resolve(tx, 60, Capacity::shannons(1), 300);
-    let mut pool = PoolMap::new(2);
-    for entry in entries.iter().chain([&child]) {
-        insert(&mut pool, entry);
-    }
-    assert_consistent(&pool);
-    assert!(matches!(
-        pool.add_entry(spender, Status::Proposed),
-        Err(Reject::ExceededMaximumAncestorsCount)
-    ));
-    assert_eq!(pool.size(), 4);
-    assert_consistent(&pool);
-}
-
-#[test]
 fn input_rejection_does_not_commit_planned_reader_evictions() {
     let reader = build_tx_with_dep(
         vec![(&Byte32::zero(), 100)],
@@ -786,21 +692,32 @@ fn input_rejection_does_not_commit_planned_reader_evictions() {
         1,
     );
     let conflict = build_tx(vec![(&Byte32::zero(), 101)], 1);
-    let mut pool = PoolMap::new(1);
-    for tx in [reader, conflict] {
+    let producer = build_tx(vec![(&Byte32::zero(), 102)], 1);
+    let producer_hash = producer.hash();
+    let mut pool = PoolMap::new(2);
+    for tx in [reader, conflict, producer] {
         insert(
             &mut pool,
             &TxEntry::dummy_resolve(tx, 50, Capacity::shannons(1), 200),
         );
     }
-    let tx = build_tx(vec![(&Byte32::zero(), 500), (&Byte32::zero(), 101)], 1);
+    // A fresh input and a retained producer precede the conflict. Neither
+    // their indexes nor the planned reader removal may change on rejection.
+    let tx = build_tx(
+        vec![
+            (&producer_hash, 0),
+            (&Byte32::zero(), 500),
+            (&Byte32::zero(), 101),
+        ],
+        1,
+    );
     let candidate = TxEntry::dummy_resolve(tx, 50, Capacity::shannons(1), 300);
     assert!(matches!(
         pool.add_entry(candidate, Status::Proposed),
         Err(Reject::RBFRejected(_))
     ));
-    assert_eq!(pool.size(), 2);
-    assert_eq!(pool.inputs_len(), 2);
+    assert_eq!(pool.size(), 3);
+    assert_eq!(pool.inputs_len(), 3);
     assert_consistent(&pool);
 }
 

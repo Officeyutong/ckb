@@ -83,34 +83,24 @@ fn assert_selection(pool: &PoolMap, bytes_limit: usize, cycles_limit: u64, expec
 }
 
 #[test]
-fn late_parent_package_respects_byte_limit() {
-    let (pool, entries) = late_parent_pool(1);
-    let bytes_limit = entries[0].size + entries[1].size;
-    assert_selection(&pool, bytes_limit, u64::MAX, &entries[..2]);
-}
-
-#[test]
-fn late_parent_package_respects_cycle_limit() {
-    let (pool, entries) = late_parent_pool(1);
-    assert_selection(&pool, usize::MAX, 200, &entries[..2]);
-}
-
-#[test]
-fn late_parent_package_respects_both_limits() {
-    let (pool, entries) = late_parent_pool(1);
-    let bytes_limit = entries[0].size + entries[1].size;
-    assert_selection(&pool, bytes_limit, 200, &entries[..2]);
-}
-
-#[test]
-fn late_parent_package_fits_exactly() {
-    let (pool, entries) = late_parent_pool(1);
-    assert_selection(
-        &pool,
-        entries.iter().map(|entry| entry.size).sum(),
-        300,
-        &entries,
-    );
+fn late_parent_package_respects_byte_and_cycle_budgets() {
+    // Exercise both the original package and the modified package after its
+    // high-fee grandparent has already been selected.
+    for grandparent_fee in [1, 2_000_000] {
+        let (pool, entries) = late_parent_pool(grandparent_fee);
+        let two_bytes = entries[0].size + entries[1].size;
+        let all_bytes = entries.iter().map(|entry| entry.size).sum();
+        for (bytes, cycles, count) in [
+            (two_bytes, u64::MAX, 2),
+            (usize::MAX, 200, 2),
+            (two_bytes, 200, 2),
+            (all_bytes, 300, 3),
+            (entries[0].size - 1, u64::MAX, 0),
+            (usize::MAX, 99, 0),
+        ] {
+            assert_selection(&pool, bytes, cycles, &entries[..count]);
+        }
+    }
 }
 
 #[test]
@@ -130,37 +120,10 @@ fn late_parent_package_uses_the_remaining_budget() {
 }
 
 #[test]
-fn modified_package_rejection_preserves_selected_prefix() {
-    let (pool, entries) = late_parent_pool(2_000_000);
-    // The grandparent wins first. Its selected cost must be subtracted once;
-    // the remaining package still contains both the parent and child.
-    assert_selection(&pool, entries[0].size + entries[1].size, 200, &entries[..2]);
-}
-
-#[test]
-fn modified_package_does_not_recharge_selected_ancestors() {
-    let (pool, entries) = late_parent_pool(2_000_000);
-    assert_selection(
-        &pool,
-        entries.iter().map(|entry| entry.size).sum(),
-        300,
-        &entries,
-    );
-}
-
-#[test]
 fn late_parent_package_waits_for_unproposed_ancestors() {
     for status in [Status::Pending, Status::Gap] {
         let (mut pool, entries) = late_parent_pool(1);
         pool.set_entry(&entries[1].proposal_short_id(), status);
         assert_selection(&pool, usize::MAX, u64::MAX, &entries[..1]);
-    }
-}
-
-#[test]
-fn late_parent_package_requires_room_for_a_transaction() {
-    let (pool, entries) = late_parent_pool(1);
-    for (bytes_limit, cycles_limit) in [(entries[0].size - 1, u64::MAX), (usize::MAX, 99)] {
-        assert_selection(&pool, bytes_limit, cycles_limit, &[]);
     }
 }

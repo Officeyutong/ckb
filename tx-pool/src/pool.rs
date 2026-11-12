@@ -24,7 +24,7 @@ use ckb_types::{
     packed::{Byte32, ProposalShortId},
 };
 use lru::LruCache;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 const COMMITTED_HASH_CACHE_SIZE: usize = 100_000;
@@ -98,17 +98,13 @@ impl TxPool {
         self.calculate_min_replace_fee(&conflicts, tx.size)
     }
 
-    /// min_replace_fee = sum(replaced_txs.fee) + extra_rbf_fee
+    /// min_replace_fee = sum(replaced_txs.fee) + extra_rbf_fee.
+    /// Both callers supply a unique descendant closure, including its roots.
     fn calculate_min_replace_fee(&self, conflicts: &[&PoolEntry], size: usize) -> Option<Capacity> {
         let extra_rbf_fee = self.config.min_rbf_rate.fee(size as u64);
-        // don't account for duplicate txs
-        let replaced_fees: HashMap<_, _> = conflicts
+        let replaced_sum_fee = conflicts
             .iter()
-            .map(|c| (c.id.clone(), c.inner.fee))
-            .collect();
-        let replaced_sum_fee = replaced_fees
-            .values()
-            .try_fold(Capacity::zero(), |acc, x| acc.safe_add(*x));
+            .try_fold(Capacity::zero(), |acc, entry| acc.safe_add(entry.inner.fee));
         let res = replaced_sum_fee.map_or(Err(CapacityError::Overflow), |sum| {
             sum.safe_add(extra_rbf_fee)
         });
