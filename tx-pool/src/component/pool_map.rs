@@ -627,7 +627,13 @@ impl PoolMap {
         entry: &TxEntry,
     ) -> Result<(TxLinks, HashSet<ProposalShortId>), Reject> {
         let tx = entry.transaction();
-        let mut parents = HashSet::new();
+        let producers: HashSet<_> = tx
+            .input_pts_iter()
+            .chain(entry.related_dep_out_points().cloned())
+            .filter_map(|point| self.get_by_tx_hash(&point.tx_hash()))
+            .map(|parent| parent.id.clone())
+            .collect();
+        let mut parents = producers.clone();
         let mut cell_ref_parents = HashSet::new();
         for input in tx.input_pts_iter() {
             if let Some(readers) = self.edges.get_deps_ref(&input) {
@@ -635,28 +641,21 @@ impl PoolMap {
                 parents.extend(readers.iter().cloned());
             }
         }
-        for point in tx
-            .input_pts_iter()
-            .chain(entry.related_dep_out_points().cloned())
-        {
-            if let Some(parent) = self.get_by_tx_hash(&point.tx_hash()) {
-                parents.insert(parent.id.clone());
-            }
-        }
         let mut ancestors = self
             .links
             .calc_relation_ids(parents.clone(), Relation::Parents);
         let mut evicted = HashSet::new();
-        if ancestors.len() + 1 > self.max_ancestors_count {
-            if (ancestors.len() + 1).saturating_sub(cell_ref_parents.len())
-                > self.max_ancestors_count
-            {
+        if ancestors.len() >= self.max_ancestors_count {
+            // Producer ancestry must survive. Evicting any of it also removes
+            // a producer and invalidates a resolved input or dependency.
+            let required = self.links.calc_relation_ids(producers, Relation::Parents);
+            if required.len() >= self.max_ancestors_count {
                 return Err(Reject::ExceededMaximumAncestorsCount);
             }
-            // Preserve the existing lowest-fee reader eviction policy, but
-            // finish validation before removing any reader or its descendants.
+            // Try removable readers in fee order. Their removal can disconnect
+            // upstream ancestors too, so recount instead of subtracting readers.
             for candidate in self.entries.iter_by_evict_key() {
-                if !cell_ref_parents.contains(&candidate.id) {
+                if !cell_ref_parents.contains(&candidate.id) || required.contains(&candidate.id) {
                     continue;
                 }
                 evicted.insert(candidate.id.clone());
@@ -689,9 +688,12 @@ impl PoolMap {
             }
         }
         children.retain(|id| !evicted.contains(id));
-        let descendants = self
+        let mut descendants = self
             .links
             .calc_relation_ids(children.clone(), Relation::Children);
+        // A retained child can still reach a removed branch. Victims include
+        // all their descendants, so validate only the surviving closure.
+        descendants.retain(|id| !evicted.contains(id));
         if !ancestors.is_disjoint(&descendants) {
             return Err(Reject::Invalidated("cyclic tx-pool dependencies".into()));
         }

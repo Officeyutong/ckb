@@ -12,7 +12,9 @@ of the changed relations while preserving alternative paths. Removing a whole
 descendant package updates only the ancestors that remain in the pool.
 
 Admission checks limits, cycles in the relation graph, and input conflicts before
-changing membership, including any planned reader evictions. Package selection
-uses these maintained statistics for capacity and dependency ordering. The
+changing membership, including any planned reader evictions. Reader evictions
+preserve the candidate's producers and their ancestors. Ancestor limits apply to
+the surviving graph, including retained descendants of a late parent. Package
+selection uses these maintained statistics for capacity and dependency ordering. The
 [relation tests](src/component/tests/relations.rs) independently reconstruct the
 graph from transaction bodies and check statistics, indexes, and rejection paths.
