@@ -617,11 +617,20 @@ impl PoolMap {
         self.entries.iter().map(|(_, entry)| entry)
     }
 
-    pub(crate) fn next_evict_entry(&self, status: Status) -> Option<ProposalShortId> {
-        self.entries
-            .iter_by_evict_key()
-            .find(move |entry| entry.status == status)
-            .map(|entry| entry.id.clone())
+    /// Capacity eviction prefers Pending, then Gap, then Proposed; within a
+    /// status it follows the package fee index. Admission excludes entries
+    /// already removed or represented by a prospective key.
+    pub(crate) fn next_evict_entry(
+        &self,
+        eligible: impl Fn(&PoolEntry) -> bool,
+    ) -> Option<&PoolEntry> {
+        [Status::Pending, Status::Gap, Status::Proposed]
+            .into_iter()
+            .find_map(|status| {
+                self.entries
+                    .iter_by_evict_key()
+                    .find(|entry| entry.status == status && eligible(entry))
+            })
     }
 
     pub(crate) fn clear(&mut self) {
@@ -910,14 +919,9 @@ impl PoolMap {
             }
             modified.insert(candidate.clone(), value.as_evict_key());
 
-            let unchanged = [Status::Pending, Status::Gap, Status::Proposed]
-                .into_iter()
-                .find_map(|status| {
-                    self.entries.iter_by_evict_key().find(|entry| {
-                        entry.status == status
-                            && !removed.contains(&entry.id)
-                            && !modified.contains_key(&entry.id)
-                    })
+            let unchanged = self
+                .next_evict_entry(|entry| {
+                    !removed.contains(&entry.id) && !modified.contains_key(&entry.id)
                 })
                 .map(|entry| (entry.status, entry.evict_key.clone(), entry.id.clone()));
             let changed = modified

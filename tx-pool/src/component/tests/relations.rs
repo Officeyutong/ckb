@@ -371,7 +371,13 @@ fn capacity_preflight_matches_materialized_eviction_on_every_four_node_dag() {
                             while reference.total_tx_size > limit {
                                 let victim = [Status::Pending, Status::Gap, Status::Proposed]
                                     .into_iter()
-                                    .find_map(|status| reference.next_evict_entry(status))
+                                    .find_map(|status| {
+                                        reference
+                                            .entries
+                                            .iter_by_evict_key()
+                                            .find(|entry| entry.status == status)
+                                            .map(|entry| entry.id.clone())
+                                    })
                                     .unwrap();
                                 reference.remove_entry_and_descendants(&victim);
                                 assert_consistent(&reference);

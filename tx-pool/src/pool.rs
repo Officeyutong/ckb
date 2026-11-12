@@ -288,14 +288,11 @@ impl TxPool {
     // Used after chain reconciliation; ordinary admission plans this before mutation.
     pub(crate) fn limit_size(&mut self, callbacks: &Callbacks) {
         while self.pool_map.total_tx_size > self.config.max_tx_pool_size {
-            let next_evict_entry = || {
-                self.pool_map
-                    .next_evict_entry(Status::Pending)
-                    .or_else(|| self.pool_map.next_evict_entry(Status::Gap))
-                    .or_else(|| self.pool_map.next_evict_entry(Status::Proposed))
-            };
-
-            if let Some(id) = next_evict_entry() {
+            if let Some(id) = self
+                .pool_map
+                .next_evict_entry(|_| true)
+                .map(|entry| entry.id.clone())
+            {
                 let removed = self.pool_map.remove_entry_and_descendants(&id);
                 for entry in removed {
                     let tx_hash = entry.transaction().hash();

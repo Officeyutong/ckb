@@ -49,19 +49,12 @@ pub enum PlugTarget {
     Proposed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TxStatus {
-    Fresh,
-    Gap,
-    Proposed,
-}
-
-impl TxStatus {
+impl Status {
     fn with_env(self, header: &HeaderView) -> TxVerifyEnv {
         match self {
-            TxStatus::Fresh => TxVerifyEnv::new_submit(header),
-            TxStatus::Gap => TxVerifyEnv::new_proposed(header, 0),
-            TxStatus::Proposed => TxVerifyEnv::new_proposed(header, 1),
+            Status::Pending => TxVerifyEnv::new_submit(header),
+            Status::Gap => TxVerifyEnv::new_proposed(header, 0),
+            Status::Proposed => TxVerifyEnv::new_proposed(header, 1),
         }
     }
 }
@@ -104,7 +97,6 @@ impl TxPoolService {
         &self,
         pre_resolve_tip: Byte32,
         entry: TxEntry,
-        mut status: TxStatus,
     ) -> (Result<(), Reject>, Arc<Snapshot>) {
         let (ret, snapshot) = self
             .with_tx_pool_write_lock(move |tx_pool, snapshot| {
@@ -127,7 +119,8 @@ impl TxPoolService {
                 // same tip. Check every resolved cell against the survivors.
                 tx_pool.check_rtx_from_pool(&entry.rtx, &conflicts)?;
 
-                // if snapshot changed by context switch we need redo time_relative verify
+                // Admission and its notifications use the current proposal state.
+                let status = get_tx_status(&snapshot, &entry.proposal_short_id());
                 let tip_hash = snapshot.tip_hash();
                 if pre_resolve_tip != tip_hash {
                     debug!(
@@ -137,26 +130,19 @@ impl TxPoolService {
                         tip_hash
                     );
 
-                    status = get_tx_status(&snapshot, &entry.proposal_short_id());
-
                     let tip_header = snapshot.tip_header();
                     let tx_env = status.with_env(tip_header);
                     time_relative_verify(snapshot, Arc::clone(&entry.rtx), tx_env)?;
                 }
 
-                let pool_status = match status {
-                    TxStatus::Fresh => Status::Pending,
-                    TxStatus::Gap => Status::Gap,
-                    TxStatus::Proposed => Status::Proposed,
-                };
                 let Some(evicted) = tx_pool.pool_map.admit_entry(
                     entry.clone(),
-                    pool_status,
+                    status,
                     conflicts,
                     tx_pool.config.max_tx_pool_size,
                 )?
                 else {
-                    return Ok(());
+                    return Ok(status);
                 };
                 let may_recovered_txs = self.record_replacements(tx_pool, &entry, evicted.replaced);
                 for evict in evicted.readers {
@@ -174,8 +160,8 @@ impl TxPoolService {
                     self.callbacks.call_reject(tx_pool, &evict, reject);
                 }
                 match status {
-                    TxStatus::Fresh | TxStatus::Gap => self.callbacks.call_pending(&entry),
-                    TxStatus::Proposed => self.callbacks.call_proposed(&entry),
+                    Status::Pending | Status::Gap => self.callbacks.call_pending(&entry),
+                    Status::Proposed => self.callbacks.call_proposed(&entry),
                 }
 
                 tx_pool.remove_conflict(&entry.proposal_short_id());
@@ -191,18 +177,23 @@ impl TxPoolService {
                         }
                     });
                 }
-                Ok(())
+                Ok(status)
             })
             .await;
 
-        (ret, snapshot)
+        // Channel backpressure must not retain the pool write lock. Publish the
+        // committed status, which can differ from the verification snapshot.
+        if let Ok(status) = &ret {
+            self.notify_block_assembler(*status).await;
+        }
+        (ret.map(|_| ()), snapshot)
     }
 
-    pub(crate) async fn notify_block_assembler(&self, status: TxStatus) {
+    async fn notify_block_assembler(&self, status: Status) {
         if self.should_notify_block_assembler() {
             let message = match status {
-                TxStatus::Fresh => Some(BlockAssemblerMessage::Pending),
-                TxStatus::Proposed => Some(BlockAssemblerMessage::Proposed),
+                Status::Pending => Some(BlockAssemblerMessage::Pending),
+                Status::Proposed => Some(BlockAssemblerMessage::Proposed),
                 _ => None,
             };
 
@@ -801,10 +792,8 @@ impl TxPoolService {
 
         let entry = TxEntry::new(rtx, verified.cycles, fee, tx_size);
 
-        let (ret, submit_snapshot) = self.submit_entry(tip_hash, entry, status).await;
+        let (ret, submit_snapshot) = self.submit_entry(tip_hash, entry).await;
         try_or_return_with_snapshot!(ret, submit_snapshot);
-
-        self.notify_block_assembler(status).await;
 
         if verify_cache.is_none() {
             // update cache
@@ -1032,20 +1021,20 @@ impl TxPoolService {
 type PreCheckedTx = (
     Byte32,                   // tip_hash
     Arc<ResolvedTransaction>, // rtx
-    TxStatus,                 // status
+    Status,                   // status
     Capacity,                 // tx fee
     usize,                    // tx size
 );
 
-type ResolveResult = Result<(Arc<ResolvedTransaction>, TxStatus), Reject>;
+type ResolveResult = Result<(Arc<ResolvedTransaction>, Status), Reject>;
 
-fn get_tx_status(snapshot: &Snapshot, short_id: &ProposalShortId) -> TxStatus {
+fn get_tx_status(snapshot: &Snapshot, short_id: &ProposalShortId) -> Status {
     if snapshot.proposals().contains_proposed(short_id) {
-        TxStatus::Proposed
+        Status::Proposed
     } else if snapshot.proposals().contains_gap(short_id) {
-        TxStatus::Gap
+        Status::Gap
     } else {
-        TxStatus::Fresh
+        Status::Pending
     }
 }
 
@@ -1066,16 +1055,16 @@ fn resolve_tx(
 // the capacity limit once the complete detached batch has been restored.
 fn readd_entry(
     tx_pool: &mut TxPool,
-    status: TxStatus,
+    status: Status,
     entry: TxEntry,
     callbacks: &Callbacks,
 ) -> Result<(), Reject> {
     let tx_hash = entry.transaction().hash();
     debug!("submit_entry {:?} {}", status, tx_hash);
     let (succ, evicts) = match status {
-        TxStatus::Fresh => tx_pool.add_pending(entry.clone())?,
-        TxStatus::Gap => tx_pool.add_gap(entry.clone())?,
-        TxStatus::Proposed => tx_pool.add_proposed(entry.clone())?,
+        Status::Pending => tx_pool.add_pending(entry.clone())?,
+        Status::Gap => tx_pool.add_gap(entry.clone())?,
+        Status::Proposed => tx_pool.add_proposed(entry.clone())?,
     };
     for evict in evicts {
         callbacks.call_reject(
@@ -1086,9 +1075,8 @@ fn readd_entry(
     }
     if succ {
         match status {
-            TxStatus::Fresh => callbacks.call_pending(&entry),
-            TxStatus::Gap => callbacks.call_pending(&entry),
-            TxStatus::Proposed => callbacks.call_proposed(&entry),
+            Status::Pending | Status::Gap => callbacks.call_pending(&entry),
+            Status::Proposed => callbacks.call_proposed(&entry),
         }
     }
     Ok(())

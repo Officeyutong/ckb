@@ -297,19 +297,12 @@ fn test_pool_evict() {
     assert!(pool.add_entry(entry2, Status::Pending).is_ok());
     assert!(pool.add_entry(entry3, Status::Pending).is_ok());
 
-    let e1 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e1, tx1.proposal_short_id());
-    pool.remove_entry(&e1);
-
-    let e2 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e2, tx2.proposal_short_id());
-    pool.remove_entry(&e2);
-
-    let e3 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e3, tx3.proposal_short_id());
-    pool.remove_entry(&e3);
-
-    assert!(pool.next_evict_entry(Status::Pending).is_none());
+    for tx in [tx1, tx2, tx3] {
+        let id = pool.next_evict_entry(|_| true).unwrap().id.clone();
+        assert_eq!(id, tx.proposal_short_id());
+        pool.remove_entry(&id);
+    }
+    assert!(pool.next_evict_entry(|_| true).is_none());
 }
 
 #[test]
@@ -335,19 +328,12 @@ fn test_pool_min_weight_evict() {
     assert!(pool.add_entry(entry2, Status::Pending).is_ok());
     assert!(pool.add_entry(entry3, Status::Pending).is_ok());
 
-    let e1 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e1, tx3.proposal_short_id());
-    pool.remove_entry(&e1);
-
-    let e2 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e2, tx2.proposal_short_id());
-    pool.remove_entry(&e2);
-
-    let e3 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e3, tx1.proposal_short_id());
-    pool.remove_entry(&e3);
-
-    assert!(pool.next_evict_entry(Status::Pending).is_none());
+    for tx in [tx3, tx2, tx1] {
+        let id = pool.next_evict_entry(|_| true).unwrap().id.clone();
+        assert_eq!(id, tx.proposal_short_id());
+        pool.remove_entry(&id);
+    }
+    assert!(pool.next_evict_entry(|_| true).is_none());
 }
 
 #[test]
@@ -373,19 +359,12 @@ fn test_pool_max_size_evict() {
     assert!(pool.add_entry(entry2, Status::Pending).is_ok());
     assert!(pool.add_entry(entry3, Status::Pending).is_ok());
 
-    let e1 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e1, tx1.proposal_short_id());
-    pool.remove_entry(&e1);
-
-    let e2 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e2, tx2.proposal_short_id());
-    pool.remove_entry(&e2);
-
-    let e3 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e3, tx3.proposal_short_id());
-    pool.remove_entry(&e3);
-
-    assert!(pool.next_evict_entry(Status::Pending).is_none());
+    for tx in [tx1, tx2, tx3] {
+        let id = pool.next_evict_entry(|_| true).unwrap().id.clone();
+        assert_eq!(id, tx.proposal_short_id());
+        pool.remove_entry(&id);
+    }
+    assert!(pool.next_evict_entry(|_| true).is_none());
 }
 
 #[test]
@@ -404,17 +383,10 @@ fn test_pool_min_descendants_evict() {
     assert!(pool.add_entry(entry2, Status::Pending).is_ok());
     assert!(pool.add_entry(entry3, Status::Pending).is_ok());
 
-    let e1 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e1, tx3.proposal_short_id());
-    pool.remove_entry(&e1);
-
-    let e2 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e2, tx2.proposal_short_id());
-    pool.remove_entry(&e2);
-
-    let e3 = pool.next_evict_entry(Status::Pending).unwrap();
-    assert_eq!(e3, tx1.proposal_short_id());
-    pool.remove_entry(&e3);
-
-    assert!(pool.next_evict_entry(Status::Pending).is_none());
+    for tx in [tx3, tx2, tx1] {
+        let id = pool.next_evict_entry(|_| true).unwrap().id.clone();
+        assert_eq!(id, tx.proposal_short_id());
+        pool.remove_entry(&id);
+    }
+    assert!(pool.next_evict_entry(|_| true).is_none());
 }

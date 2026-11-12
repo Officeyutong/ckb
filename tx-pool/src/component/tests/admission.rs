@@ -3,7 +3,7 @@ use super::{
     relations::assert_consistent,
     util::{build_tx, build_tx_with_dep},
 };
-use crate::{TxEntry, callback::Callbacks, error::Reject, process::TxStatus};
+use crate::{TxEntry, callback::Callbacks, error::Reject};
 use ckb_types::{
     core::{Capacity, DepType, FeeRate, cell::CellMeta},
     packed::{CellDep, OutPoint},
@@ -86,7 +86,7 @@ async fn rejected_replacement_preserves_membership(capacity: bool) {
         }
         pool.snapshot().tip_hash()
     };
-    let (result, _) = service.submit_entry(tip, candidate, TxStatus::Fresh).await;
+    let (result, _) = service.submit_entry(tip, candidate).await;
     if capacity {
         assert!(matches!(result, Err(Reject::Full(_))));
     } else {
@@ -158,9 +158,7 @@ async fn accepted_replacement_and_capacity_eviction_publish_only_committed_membe
         }
         pool.snapshot().tip_hash()
     };
-    let (result, _) = service
-        .submit_entry(tip, candidate.clone(), TxStatus::Fresh)
-        .await;
+    let (result, _) = service.submit_entry(tip, candidate.clone()).await;
     assert!(result.is_ok(), "{result:?}");
     let pool = service.tx_pool.read().await;
     let calls = calls.lock().unwrap();
@@ -211,7 +209,7 @@ async fn accepted_spender_reports_reader_package_evictions_after_commit() {
         }
         pool.snapshot().tip_hash()
     };
-    let (result, _) = service.submit_entry(tip, candidate, TxStatus::Fresh).await;
+    let (result, _) = service.submit_entry(tip, candidate).await;
     assert!(result.is_ok(), "{result:?}");
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
@@ -295,7 +293,7 @@ async fn replacement_preserves_expanded_dep_group_backing() {
         pool.add_pending(original.clone()).unwrap();
         pool.snapshot().tip_hash()
     };
-    let (result, _) = service.submit_entry(tip, candidate, TxStatus::Fresh).await;
+    let (result, _) = service.submit_entry(tip, candidate).await;
     assert!(matches!(
         result,
         Err(Reject::RBFRejected(_)) | Err(Reject::Resolve(_))
@@ -382,9 +380,7 @@ async fn submission_rechecks_backing_changed_during_verification_at_the_same_tip
             .iter()
             .map(|entry| entry.id.clone())
             .collect::<HashSet<_>>();
-        let (result, snapshot) = service
-            .submit_entry(tip.clone(), candidate, TxStatus::Fresh)
-            .await;
+        let (result, snapshot) = service.submit_entry(tip.clone(), candidate).await;
         assert_eq!(snapshot.tip_hash(), tip);
         assert!(matches!(result, Err(Reject::Resolve(_))));
         let pool = service.tx_pool.read().await;
@@ -397,6 +393,88 @@ async fn submission_rechecks_backing_changed_during_verification_at_the_same_tip
         );
         assert_consistent(&pool.pool_map);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn submission_notifies_committed_status_without_holding_the_pool_lock() {
+    use crate::{
+        block_assembler::BlockAssembler, component::pool_map::Status,
+        service::BlockAssemblerMessage,
+    };
+    use ckb_db::RocksDB;
+    use ckb_snapshot::Snapshot;
+    use ckb_store::ChainDB;
+    use futures_util::poll;
+    use tokio::sync::mpsc;
+
+    let mut service = service();
+    let directory = tempfile::tempdir().unwrap();
+    let store = ChainDB::new(
+        RocksDB::open_in(&directory, ckb_db_schema::COLUMNS),
+        Default::default(),
+    );
+    store.init(&service.consensus).unwrap();
+    let snapshot = Arc::new(Snapshot::new(
+        service.consensus.genesis_block().header(),
+        Default::default(),
+        service.consensus.genesis_epoch_ext().clone(),
+        store.get_snapshot(),
+        Default::default(),
+        Arc::clone(&service.consensus),
+    ));
+    let config = serde_json::from_value(serde_json::json!({
+        "code_hash": ckb_types::H256::default(),
+        "args": "0x", "message": "0x", "hash_type": "data"
+    }))
+    .unwrap();
+    service.block_assembler = Some(BlockAssembler::new(config, Arc::clone(&snapshot)).unwrap());
+    let (sender, mut receiver) = mpsc::channel(1);
+    sender.try_send(BlockAssemblerMessage::Uncle).unwrap();
+    service.block_assembler_sender = sender;
+    let candidate = entry(90, &[], 100, 1);
+    let id = candidate.proposal_short_id();
+    {
+        let mut pool = service.tx_pool.write().await;
+        pool.snapshot = Arc::clone(&snapshot);
+        pool.add_pending(funding()).unwrap();
+    }
+    // The chain changed since verification. The current branch has no
+    // proposal, so both admission and its notification must use Pending.
+    let previous_tip = snapshot
+        .tip_header()
+        .as_advanced_builder()
+        .timestamp(1)
+        .build()
+        .hash();
+    assert_ne!(previous_tip, snapshot.tip_hash());
+    let submit = service.submit_entry(previous_tip, candidate.clone());
+    tokio::pin!(submit);
+    assert!(poll!(&mut submit).is_pending());
+    // A full notification channel suspends publication after the commit; the
+    // pool lock must already be available, without a sleep or scheduling race.
+    {
+        let pool = service.tx_pool.try_write().unwrap();
+        assert_eq!(
+            pool.pool_map.get_by_id(&id).unwrap().status,
+            Status::Pending
+        );
+    }
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        BlockAssemblerMessage::Uncle
+    ));
+    assert!(submit.await.0.is_ok());
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        BlockAssemblerMessage::Pending
+    ));
+    assert!(receiver.try_recv().is_err());
+    let (result, _) = service.submit_entry(snapshot.tip_hash(), candidate).await;
+    assert!(matches!(result, Err(Reject::Duplicated(_))));
+    assert!(
+        receiver.try_recv().is_err(),
+        "rejection must not publish acceptance"
+    );
 }
 
 #[tokio::test]
