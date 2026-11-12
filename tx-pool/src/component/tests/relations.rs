@@ -47,7 +47,7 @@ fn closure(start: usize, direct: &[HashSet<usize>]) -> HashSet<usize> {
 
 /// Derive relations from retained bodies, independently of links and cached
 /// statistics. Check both materialized keys and their ordered indexes.
-fn assert_consistent(pool: &PoolMap) {
+pub(super) fn assert_consistent(pool: &PoolMap) {
     let entries: Vec<_> = pool.iter().collect();
     let mut parents = vec![HashSet::new(); entries.len()];
     let mut children = parents.clone();
@@ -312,6 +312,130 @@ fn every_five_node_dag_preserves_statistics_across_membership_changes() {
                 pool.remove_entry(&entries[index].proposal_short_id())
                     .unwrap();
                 assert_consistent(&pool);
+            }
+        }
+    }
+}
+
+#[test]
+fn capacity_preflight_matches_materialized_eviction_on_every_four_node_dag() {
+    let edges: Vec<_> = (0..4)
+        .flat_map(|parent| (parent + 1..4).map(move |child| (parent, child)))
+        .collect();
+    let ids = |pool: &PoolMap| {
+        pool.iter()
+            .map(|entry| entry.id.clone())
+            .collect::<HashSet<_>>()
+    };
+    for mask in 0..1usize << edges.len() {
+        let mut parents = vec![Vec::new(); 4];
+        for (bit, &(parent, child)) in edges.iter().enumerate() {
+            if mask & (1 << bit) != 0 {
+                parents[child].push(parent);
+            }
+        }
+        let entries = graph(&parents.iter().map(Vec::as_slice).collect::<Vec<_>>());
+        for candidate in 0..4 {
+            for mixed_status in [false, true] {
+                for replaced_root in [None, Some(0), Some(1), Some(2), Some(3)] {
+                    if replaced_root == Some(candidate) {
+                        continue;
+                    }
+                    for limit in [0, 250, 500, 750, 1_000, usize::MAX] {
+                        let status = |index| {
+                            if mixed_status {
+                                [Status::Pending, Status::Gap, Status::Proposed][index % 3]
+                            } else {
+                                Status::Proposed
+                            }
+                        };
+                        let mut actual = PoolMap::new(4);
+                        let mut reference = PoolMap::new(4);
+                        for (index, entry) in entries
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| *index != candidate)
+                        {
+                            actual.add_entry(entry.clone(), status(index)).unwrap();
+                            reference.add_entry(entry.clone(), status(index)).unwrap();
+                        }
+                        let before = ids(&actual);
+                        let candidate_entry = &entries[candidate];
+                        let replaced: HashSet<_> = replaced_root
+                            .into_iter()
+                            .flat_map(|index| {
+                                reference.remove_entry_and_descendants(
+                                    &entries[index].proposal_short_id(),
+                                )
+                            })
+                            .map(|entry| entry.proposal_short_id())
+                            .collect();
+                        let missing_backing =
+                            candidate_entry.related_dep_out_points().any(|point| {
+                                actual
+                                    .get_by_tx_hash(&point.tx_hash())
+                                    .is_some_and(|producer| replaced.contains(&producer.id))
+                            });
+                        let result = actual.admit_entry(
+                            candidate_entry.clone(),
+                            status(candidate),
+                            replaced.clone(),
+                            limit,
+                        );
+                        if missing_backing {
+                            assert!(matches!(result, Err(Reject::Resolve(_))));
+                            assert_eq!(ids(&actual), before);
+                        } else {
+                            reference
+                                .add_entry(candidate_entry.clone(), status(candidate))
+                                .unwrap();
+                            while reference.total_tx_size > limit {
+                                let victim = [Status::Pending, Status::Gap, Status::Proposed]
+                                    .into_iter()
+                                    .find_map(|status| reference.next_evict_entry(status))
+                                    .unwrap();
+                                reference.remove_entry_and_descendants(&victim);
+                                assert_consistent(&reference);
+                            }
+                            if reference
+                                .get(&candidate_entry.proposal_short_id())
+                                .is_some()
+                            {
+                                let evicted = result.unwrap().unwrap();
+                                assert_eq!(
+                                    ids(&actual),
+                                    ids(&reference),
+                                    "mask {mask} candidate {candidate} replaced {replaced_root:?} limit {limit}"
+                                );
+                                assert_eq!(
+                                    evicted
+                                        .replaced
+                                        .iter()
+                                        .map(TxEntry::proposal_short_id)
+                                        .collect::<HashSet<_>>(),
+                                    replaced
+                                );
+                                assert!(evicted.readers.is_empty());
+                                assert_eq!(
+                                    evicted
+                                        .capacity
+                                        .iter()
+                                        .map(TxEntry::proposal_short_id)
+                                        .collect::<HashSet<_>>(),
+                                    before
+                                        .difference(&ids(&reference))
+                                        .filter(|id| !replaced.contains(*id))
+                                        .cloned()
+                                        .collect()
+                                );
+                            } else {
+                                assert!(matches!(result, Err(Reject::Full(_))));
+                                assert_eq!(ids(&actual), before);
+                            }
+                        }
+                        assert_consistent(&actual);
+                    }
+                }
             }
         }
     }

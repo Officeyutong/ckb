@@ -107,6 +107,7 @@ impl TxPoolService {
     ) -> (Result<(), Reject>, Arc<Snapshot>) {
         let (ret, snapshot) = self
             .with_tx_pool_write_lock(move |tx_pool, snapshot| {
+                check_duplicate_proposal_id(tx_pool, entry.transaction())?;
                 // check_rbf must be invoked in `write` lock to avoid concurrent issues.
                 let conflicts = if tx_pool.enable_rbf() {
                     tx_pool.check_rbf(&snapshot, &entry)?
@@ -121,6 +122,10 @@ impl TxPoolService {
                     HashSet::new()
                 };
 
+                // Pool membership can change during verification even at the
+                // same tip. Check every resolved cell against the survivors.
+                tx_pool.check_rtx_from_pool(&entry.rtx, &conflicts)?;
+
                 // if snapshot changed by context switch we need redo time_relative verify
                 let tip_hash = snapshot.tip_hash();
                 if pre_resolve_tip != tip_hash {
@@ -131,31 +136,48 @@ impl TxPoolService {
                         tip_hash
                     );
 
-                    // destructuring assignments are not currently supported
-                    status = check_rtx(tx_pool, &snapshot, &entry.rtx)?;
+                    status = get_tx_status(&snapshot, &entry.proposal_short_id());
 
                     let tip_header = snapshot.tip_header();
                     let tx_env = status.with_env(tip_header);
                     time_relative_verify(snapshot, Arc::clone(&entry.rtx), tx_env)?;
                 }
 
-                let may_recovered_txs = self.process_rbf(tx_pool, &entry, &conflicts);
-                let evicted = _submit_entry(tx_pool, status, entry.clone(), &self.callbacks)?;
-
-                // in a corner case, a tx with lower fee rate may be rejected immediately
-                // after inserting into pool, return proper reject error here
-                for evict in evicted {
+                let pool_status = match status {
+                    TxStatus::Fresh => Status::Pending,
+                    TxStatus::Gap => Status::Gap,
+                    TxStatus::Proposed => Status::Proposed,
+                };
+                let Some(evicted) = tx_pool.pool_map.admit_entry(
+                    entry.clone(),
+                    pool_status,
+                    conflicts,
+                    tx_pool.config.max_tx_pool_size,
+                )?
+                else {
+                    return Ok(());
+                };
+                let may_recovered_txs = self.record_replacements(tx_pool, &entry, evicted.replaced);
+                for evict in evicted.readers {
                     let reject = Reject::Invalidated(format!(
                         "invalidated by tx {}",
-                        evict.transaction().hash()
+                        entry.transaction().hash()
                     ));
                     self.callbacks.call_reject(tx_pool, &evict, reject);
                 }
+                for evict in evicted.capacity {
+                    let reject = Reject::Full(format!(
+                        "the fee_rate for this transaction is: {}",
+                        evict.fee_rate()
+                    ));
+                    self.callbacks.call_reject(tx_pool, &evict, reject);
+                }
+                match status {
+                    TxStatus::Fresh | TxStatus::Gap => self.callbacks.call_pending(&entry),
+                    TxStatus::Proposed => self.callbacks.call_proposed(&entry),
+                }
 
                 tx_pool.remove_conflict(&entry.proposal_short_id());
-                tx_pool
-                    .limit_size(&self.callbacks, Some(&entry.proposal_short_id()))
-                    .map_or(Ok(()), Err)?;
 
                 if !may_recovered_txs.is_empty() {
                     let self_clone = self.clone();
@@ -191,37 +213,29 @@ impl TxPoolService {
         }
     }
 
-    // try to remove conflicted tx here, the returned txs can be re-verified and re-submitted
-    // since they maybe not conflicted anymore
-    fn process_rbf(
+    // Membership has committed. Record replacement notices and identify
+    // transactions that can now be re-verified using released inputs.
+    fn record_replacements(
         &self,
         tx_pool: &mut TxPool,
         entry: &TxEntry,
-        conflicts: &HashSet<ProposalShortId>,
+        all_removed: Vec<TxEntry>,
     ) -> Vec<TransactionView> {
-        let mut may_recovered_txs = vec![];
-        let mut available_inputs = HashSet::new();
-
-        if conflicts.is_empty() {
-            return may_recovered_txs;
+        if all_removed.is_empty() {
+            return Vec::new();
         }
 
-        let all_removed: Vec<_> = conflicts
+        let mut available_inputs: HashSet<_> = all_removed
             .iter()
-            .flat_map(|id| tx_pool.pool_map.remove_entry_and_descendants(id))
+            .flat_map(|removed| removed.transaction().input_pts_iter())
             .collect();
-
-        available_inputs.extend(
-            all_removed
-                .iter()
-                .flat_map(|removed| removed.transaction().input_pts_iter()),
-        );
 
         for input in entry.transaction().input_pts_iter() {
             available_inputs.remove(&input);
         }
 
-        may_recovered_txs = tx_pool.get_conflicted_txs_from_inputs(available_inputs.into_iter());
+        let may_recovered_txs =
+            tx_pool.get_conflicted_txs_from_inputs(available_inputs.into_iter());
         for old in all_removed {
             debug!(
                 "remove conflict tx {} for RBF by new tx {}",
@@ -853,6 +867,7 @@ impl TxPoolService {
             // notice: readd_detached_tx don't update cache
             self.readd_detached_tx(&mut tx_pool, retain, fetched_cache)
                 .await;
+            tx_pool.limit_size(&self.callbacks);
         }
 
         self.remove_orphan_txs_by_attach(&attached).await;
@@ -911,7 +926,7 @@ impl TxPoolService {
                 .await
                 {
                     let entry = TxEntry::new(rtx, verified.cycles, fee, tx_size);
-                    if let Err(e) = _submit_entry(tx_pool, status, entry, &self.callbacks) {
+                    if let Err(e) = readd_entry(tx_pool, status, entry, &self.callbacks) {
                         error!("readd_detached_tx submit_entry {} error {}", tx_hash, e);
                     } else {
                         debug!("readd_detached_tx submit_entry {}", tx_hash);
@@ -998,16 +1013,6 @@ fn get_tx_status(snapshot: &Snapshot, short_id: &ProposalShortId) -> TxStatus {
     }
 }
 
-fn check_rtx(
-    tx_pool: &TxPool,
-    snapshot: &Snapshot,
-    rtx: &ResolvedTransaction,
-) -> Result<TxStatus, Reject> {
-    let short_id = rtx.transaction.proposal_short_id();
-    let tx_status = get_tx_status(snapshot, &short_id);
-    tx_pool.check_rtx_from_pool(rtx).map(|_| tx_status)
-}
-
 fn resolve_tx(
     tx_pool: &TxPool,
     snapshot: &Snapshot,
@@ -1021,12 +1026,14 @@ fn resolve_tx(
         .map(|rtx| (rtx, tx_status))
 }
 
-fn _submit_entry(
+// Reorg restoration checks each entry while holding the pool lock, then applies
+// the capacity limit once the complete detached batch has been restored.
+fn readd_entry(
     tx_pool: &mut TxPool,
     status: TxStatus,
     entry: TxEntry,
     callbacks: &Callbacks,
-) -> Result<HashSet<TxEntry>, Reject> {
+) -> Result<(), Reject> {
     let tx_hash = entry.transaction().hash();
     debug!("submit_entry {:?} {}", status, tx_hash);
     let (succ, evicts) = match status {
@@ -1034,6 +1041,13 @@ fn _submit_entry(
         TxStatus::Gap => tx_pool.add_gap(entry.clone())?,
         TxStatus::Proposed => tx_pool.add_proposed(entry.clone())?,
     };
+    for evict in evicts {
+        callbacks.call_reject(
+            tx_pool,
+            &evict,
+            Reject::Invalidated(format!("invalidated by tx {}", tx_hash)),
+        );
+    }
     if succ {
         match status {
             TxStatus::Fresh => callbacks.call_pending(&entry),
@@ -1041,7 +1055,7 @@ fn _submit_entry(
             TxStatus::Proposed => callbacks.call_proposed(&entry),
         }
     }
-    Ok(evicts)
+    Ok(())
 }
 
 fn _update_tx_pool_for_reorg(
@@ -1055,11 +1069,8 @@ fn _update_tx_pool_for_reorg(
 ) {
     tx_pool.snapshot = Arc::clone(&snapshot);
 
-    // NOTE: `remove_by_detached_proposal` will try to re-put the given expired/detached proposals into
-    // pending-pool if they can be found within txpool. As for a transaction
-    // which is both expired and committed at the one time(commit at its end of commit-window),
-    // we should treat it as a committed and not re-put into pending-pool. So we should ensure
-    // that involves `remove_committed_txs` before `remove_expired`.
+    // A transaction committed at the end of its proposal window must be removed
+    // before detached proposals are returned to Pending.
     tx_pool.remove_committed_txs(attached.iter(), callbacks, detached_headers);
     tx_pool.remove_by_detached_proposal(detached_proposal_id.iter());
 
@@ -1116,7 +1127,4 @@ fn _update_tx_pool_for_reorg(
 
     // Remove expired transaction from pending
     tx_pool.remove_expired(callbacks);
-
-    // Remove transactions from the pool until its size <= size_limit.
-    let _ = tx_pool.limit_size(callbacks, None);
 }

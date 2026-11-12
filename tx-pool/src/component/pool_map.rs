@@ -17,8 +17,16 @@ use ckb_types::{
     packed::{Byte32, CellOutput, ProposalShortId},
 };
 use multi_index_map::MultiIndexMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 type ConflictEntry = (TxEntry, Reject);
+
+/// Removal reasons are retained until the complete admission has committed.
+#[derive(Default)]
+pub(crate) struct EntryEvictions {
+    pub(crate) replaced: Vec<TxEntry>,
+    pub(crate) readers: Vec<TxEntry>,
+    pub(crate) capacity: Vec<TxEntry>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Status {
@@ -227,25 +235,49 @@ impl PoolMap {
     ///   Currently, evicts when inserting is only due to referring cell dep will be consumed by this new transaction.
     pub(crate) fn add_entry(
         &mut self,
-        mut entry: TxEntry,
+        entry: TxEntry,
         status: Status,
     ) -> Result<(bool, HashSet<TxEntry>), Reject> {
+        self.admit_entry(entry, status, HashSet::new(), usize::MAX)
+            .map(|evictions| match evictions {
+                Some(evictions) => (true, evictions.readers.into_iter().collect()),
+                None => (false, HashSet::new()),
+            })
+    }
+
+    /// Admit against the surviving graph, including replacement and capacity
+    /// removals. `replaced` is the descendant-closed set checked by RBF policy.
+    /// All rejection precedes mutation; a duplicate returns `None`.
+    pub(crate) fn admit_entry(
+        &mut self,
+        mut entry: TxEntry,
+        status: Status,
+        replaced: HashSet<ProposalShortId>,
+        max_size: usize,
+    ) -> Result<Option<EntryEvictions>, Reject> {
         let tx_short_id = entry.proposal_short_id();
         if self.entries.get_by_id(&tx_short_id).is_some() {
-            return Ok((false, Default::default()));
+            return Ok(None);
         }
-        self.check_stat_for_add_tx(entry.size, entry.cycles)?;
-        let (links, evicted_ids) = self.prepare_entry_links(&entry)?;
-        self.edges.check_inputs(
-            entry.transaction().input_pts_iter(),
-            &tx_short_id,
-            &evicted_ids,
-        )?;
+        let (mut links, mut removed) = self.prepare_entry_links(&entry, replaced.clone())?;
+        self.edges
+            .check_inputs(entry.transaction().input_pts_iter(), &tx_short_id, &removed)?;
+        let capacity =
+            self.prepare_size_evictions(&entry, status, &mut links, &mut removed, max_size)?;
 
-        // All rejection precedes mutation. Removing planned victims can only
-        // reduce the totals checked above and cannot disconnect a retained path
-        // through them: the eviction set includes every victim's descendants.
-        let evicts = self.remove_entries(evicted_ids);
+        // Every removal is descendant-closed and preserves the candidate's
+        // producers. No retained path crosses a removed entry.
+        let mut evictions = EntryEvictions::default();
+        for old in self.remove_entries(removed) {
+            let id = old.proposal_short_id();
+            if replaced.contains(&id) {
+                evictions.replaced.push(old);
+            } else if capacity.contains(&id) {
+                evictions.capacity.push(old);
+            } else {
+                evictions.readers.push(old);
+            }
+        }
         trace!("pool_map.add_{:?} {}", status, entry.transaction().hash());
         entry.reset_statistic_state();
         self.update_relations(&mut entry, &links, EntryOp::Add);
@@ -261,7 +293,7 @@ impl PoolMap {
         self.track_entry_statics(None, Some(status));
         self.total_tx_size += entry.size;
         self.total_tx_cycles += entry.cycles;
-        Ok((true, evicts.into_iter().collect()))
+        Ok(Some(evictions))
     }
 
     /// Change the status of the entry, only used for `gap_rtx` and `proposed_rtx`
@@ -625,14 +657,21 @@ impl PoolMap {
     fn prepare_entry_links(
         &self,
         entry: &TxEntry,
+        mut evicted: HashSet<ProposalShortId>,
     ) -> Result<(TxLinks, HashSet<ProposalShortId>), Reject> {
         let tx = entry.transaction();
-        let producers: HashSet<_> = tx
+        let mut producers = HashSet::new();
+        for point in tx
             .input_pts_iter()
             .chain(entry.related_dep_out_points().cloned())
-            .filter_map(|point| self.get_by_tx_hash(&point.tx_hash()))
-            .map(|parent| parent.id.clone())
-            .collect();
+        {
+            if let Some(producer) = self.get_by_tx_hash(&point.tx_hash()) {
+                if evicted.contains(&producer.id) {
+                    return Err(Reject::Resolve(OutPointError::Dead(point)));
+                }
+                producers.insert(producer.id.clone());
+            }
+        }
         let mut parents = producers.clone();
         let mut cell_ref_parents = HashSet::new();
         for input in tx.input_pts_iter() {
@@ -641,10 +680,10 @@ impl PoolMap {
                 parents.extend(readers.iter().cloned());
             }
         }
+        parents.retain(|id| !evicted.contains(id));
         let mut ancestors = self
             .links
             .calc_relation_ids(parents.clone(), Relation::Parents);
-        let mut evicted = HashSet::new();
         if ancestors.len() >= self.max_ancestors_count {
             // Producer ancestry must survive. Evicting any of it also removes
             // a producer and invalidates a resolved input or dependency.
@@ -655,7 +694,10 @@ impl PoolMap {
             // Try removable readers in fee order. Their removal can disconnect
             // upstream ancestors too, so recount instead of subtracting readers.
             for candidate in self.entries.iter_by_evict_key() {
-                if !cell_ref_parents.contains(&candidate.id) || required.contains(&candidate.id) {
+                if !cell_ref_parents.contains(&candidate.id)
+                    || required.contains(&candidate.id)
+                    || evicted.contains(&candidate.id)
+                {
                     continue;
                 }
                 evicted.insert(candidate.id.clone());
@@ -712,6 +754,116 @@ impl PoolMap {
             }
         }
         Ok((TxLinks { parents, children }, evicted))
+    }
+
+    /// Simulate size eviction over the prospective membership. Only entries
+    /// whose descendant package changes need a temporary eviction key; all
+    /// other entries retain their existing ordered index. No pool clone or
+    /// speculative live mutation is needed, including on rejection.
+    fn prepare_size_evictions(
+        &self,
+        entry: &TxEntry,
+        status: Status,
+        links: &mut TxLinks,
+        removed: &mut HashSet<ProposalShortId>,
+        max_size: usize,
+    ) -> Result<HashSet<ProposalShortId>, Reject> {
+        let mut size = self.check_stat_for_add_tx(entry, removed)?;
+        let mut capacity = HashSet::new();
+        if size <= max_size {
+            return Ok(capacity);
+        }
+        let full = || {
+            Reject::Full(format!(
+                "the fee_rate for this transaction is: {}",
+                entry.fee_rate()
+            ))
+        };
+        if entry.size > max_size {
+            return Err(full());
+        }
+        let candidate = entry.proposal_short_id();
+        let ancestors = self
+            .links
+            .calc_relation_ids(links.parents.clone(), Relation::Parents);
+        let mut affected = ancestors.clone();
+        for id in removed.iter() {
+            affected.extend(self.calc_ancestors(id));
+        }
+        let mut modified = HashMap::new();
+        loop {
+            let mut children = self
+                .links
+                .calc_relation_ids(links.children.clone(), Relation::Children);
+            children.retain(|id| !removed.contains(id));
+            for id in affected.drain() {
+                if removed.contains(&id) {
+                    continue;
+                }
+                let mut value = self.get_by_id_checked(&id).inner.clone();
+                let mut descendants = self.calc_descendants(&id);
+                value.reset_statistic_state();
+                if ancestors.contains(&id) {
+                    descendants.extend(children.iter().cloned());
+                    value.add_descendant_weight(entry);
+                }
+                for descendant in descendants.difference(removed) {
+                    value.add_descendant_weight(&self.get_by_id_checked(descendant).inner);
+                }
+                modified.insert(id, value.as_evict_key());
+            }
+            let mut value = entry.clone();
+            value.reset_statistic_state();
+            for child in children {
+                value.add_descendant_weight(&self.get_by_id_checked(&child).inner);
+            }
+            modified.insert(candidate.clone(), value.as_evict_key());
+
+            let unchanged = [Status::Pending, Status::Gap, Status::Proposed]
+                .into_iter()
+                .find_map(|status| {
+                    self.entries.iter_by_evict_key().find(|entry| {
+                        entry.status == status
+                            && !removed.contains(&entry.id)
+                            && !modified.contains_key(&entry.id)
+                    })
+                })
+                .map(|entry| (entry.status, entry.evict_key.clone(), entry.id.clone()));
+            let changed = modified
+                .iter()
+                .map(|(id, key)| {
+                    let status = if id == &candidate {
+                        status
+                    } else {
+                        self.get_by_id_checked(id).status
+                    };
+                    (status, key.clone(), id.clone())
+                })
+                .min();
+            let (_, _, root) = unchanged
+                .into_iter()
+                .chain(changed)
+                .min()
+                .ok_or_else(full)?;
+            if root == candidate || ancestors.contains(&root) {
+                return Err(full());
+            }
+            let mut victims = self.calc_descendants(&root);
+            victims.insert(root);
+            victims.retain(|id| !removed.contains(id));
+            for id in &victims {
+                size -= self.get_by_id_checked(id).inner.size;
+                modified.remove(id);
+                affected.extend(self.calc_ancestors(id));
+            }
+            affected.extend(ancestors.iter().cloned());
+            capacity.extend(victims.iter().cloned());
+            removed.extend(victims);
+            if size <= max_size {
+                links.children.retain(|id| !removed.contains(id));
+                return Ok(capacity);
+            }
+        }
     }
 
     fn remove_entry_edges(&mut self, entry: &TxEntry) {
@@ -783,20 +935,31 @@ impl PoolMap {
     }
 
     /// Check size and cycle totals before any membership mutation.
-    fn check_stat_for_add_tx(&self, tx_size: usize, cycles: Cycle) -> Result<(), Reject> {
-        self.total_tx_size.checked_add(tx_size).ok_or_else(|| {
+    fn check_stat_for_add_tx(
+        &self,
+        entry: &TxEntry,
+        removed: &HashSet<ProposalShortId>,
+    ) -> Result<usize, Reject> {
+        let mut size = self.total_tx_size;
+        let mut cycles = self.total_tx_cycles;
+        for id in removed {
+            let old = &self.get_by_id_checked(id).inner;
+            size -= old.size;
+            cycles -= old.cycles;
+        }
+        let size = size.checked_add(entry.size).ok_or_else(|| {
             Reject::Full(format!(
                 "tx-pool total_tx_size {} overflows by add {}",
-                self.total_tx_size, tx_size
+                size, entry.size
             ))
         })?;
-        self.total_tx_cycles.checked_add(cycles).ok_or_else(|| {
+        cycles.checked_add(entry.cycles).ok_or_else(|| {
             Reject::Full(format!(
                 "tx-pool total_tx_cycles {} overflows by add {}",
-                self.total_tx_cycles, cycles
+                cycles, entry.cycles
             ))
         })?;
-        Ok(())
+        Ok(size)
     }
 
     /// Update size and cycles statistics for remove tx

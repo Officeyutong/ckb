@@ -1,3 +1,4 @@
+mod admission;
 mod chunk;
 mod entry;
 mod estimate;

@@ -1881,6 +1881,7 @@ dependencies = [
  "ckb-channel",
  "ckb-dao",
  "ckb-db",
+ "ckb-db-schema",
  "ckb-error",
  "ckb-fee-estimator",
  "ckb-hash",
