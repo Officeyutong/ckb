@@ -143,16 +143,25 @@ impl Merge for MergeHeaderDigest {
     type Item = packed::HeaderDigest;
 
     fn merge(lhs: &Self::Item, rhs: &Self::Item) -> MMRResult<Self::Item> {
-        let children_hash = {
-            let mut hasher = new_blake2b();
-            let mut hash = [0u8; 32];
-            hasher.update(&lhs.calc_mmr_hash().raw_data());
-            hasher.update(&rhs.calc_mmr_hash().raw_data());
-            hasher.finalize(&mut hash);
-            hash
+        // 1. Merge total difficulties.
+        //
+        // The values being added are not necessarily canonical: digests are
+        // merged as part of proof verification, before their contents have been
+        // checked, so each `total_difficulty` can be any `U256`. Release builds
+        // enable overflow checks, so use checked arithmetic and report an error
+        // rather than panicking. Check this before hashing so invalid input
+        // does not cost a blake2b computation.
+        let total_difficulty = {
+            let l: U256 = lhs.total_difficulty().into();
+            let r: U256 = rhs.total_difficulty().into();
+            l.checked_add(&r).ok_or_else(|| {
+                MMRError::MergeError(format!(
+                    "failed since the total difficulty overflows ({l} + {r})"
+                ))
+            })?
         };
 
-        // 1. Check block numbers.
+        // 2. Check block numbers.
         //
         // `checked_add` rather than `saturating_add`: saturating would make
         // `u64::MAX + 1 == u64::MAX`, so a digest ending at `u64::MAX` followed
@@ -166,7 +175,7 @@ impl Merge for MergeHeaderDigest {
             return Err(MMRError::MergeError(errmsg));
         }
 
-        // 2. Check epochs.
+        // 3. Check epochs.
         let lhs_end_epoch: EpochNumberWithFraction = lhs.end_epoch().into();
         let rhs_start_epoch: EpochNumberWithFraction = rhs.start_epoch().into();
         if !rhs_start_epoch.is_successor_of(lhs_end_epoch) && !lhs_end_epoch.is_genesis() {
@@ -176,21 +185,13 @@ impl Merge for MergeHeaderDigest {
             return Err(MMRError::MergeError(errmsg));
         }
 
-        // 3. Merge total difficulties.
-        //
-        // The values being added are not necessarily canonical: digests are
-        // merged as part of proof verification, before their contents have been
-        // checked, so each `total_difficulty` can be any `U256`. Release builds
-        // enable overflow checks, so use checked arithmetic and report an error
-        // rather than aborting.
-        let total_difficulty = {
-            let l: U256 = lhs.total_difficulty().into();
-            let r: U256 = rhs.total_difficulty().into();
-            l.checked_add(&r).ok_or_else(|| {
-                MMRError::MergeError(format!(
-                    "failed since the total difficulty overflows ({l} + {r})"
-                ))
-            })?
+        let children_hash = {
+            let mut hasher = new_blake2b();
+            let mut hash = [0u8; 32];
+            hasher.update(&lhs.calc_mmr_hash().raw_data());
+            hasher.update(&rhs.calc_mmr_hash().raw_data());
+            hasher.finalize(&mut hash);
+            hash
         };
 
         Ok(Self::Item::new_builder()
@@ -293,10 +294,23 @@ impl VerifiableHeader {
     }
 
     /// Returns the total difficulty.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parent total difficulty and the block difficulty cannot be
+    /// added without overflowing. Use [`Self::checked_total_difficulty`] when
+    /// the header comes from an untrusted source.
     pub fn total_difficulty(&self) -> U256 {
+        self.checked_total_difficulty()
+            .expect("total difficulty overflow")
+    }
+
+    /// Returns the total difficulty, or `None` if adding the parent total
+    /// difficulty and the block difficulty would overflow.
+    pub fn checked_total_difficulty(&self) -> Option<U256> {
         let parent_total_difficulty: U256 = self.parent_chain_root.total_difficulty().into();
         let block_difficulty = compact_to_difficulty(self.header.compact_target());
-        parent_total_difficulty + block_difficulty
+        parent_total_difficulty.checked_add(&block_difficulty)
     }
 }
 
