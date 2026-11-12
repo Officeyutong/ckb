@@ -21,6 +21,9 @@ cover retained descendants of a late parent. Capacity preflight recalculates onl
 affected eviction keys, retaining the existing status and fee priorities without
 cloning or tentatively changing the pool. A rejected admission leaves membership,
 indexes, conflict history, and callbacks unchanged.
+Accounting preflight uses checked arithmetic and rejects an underflow or overflow
+before mutation. Capacity planning keeps the candidate's cost separate from the
+retained totals so it cannot conceal an underflow while subtracting victims.
 
 Submission rechecks resolved backing under the pool write lock even when the chain
 tip has not changed during verification. Replacement counts shared victims once

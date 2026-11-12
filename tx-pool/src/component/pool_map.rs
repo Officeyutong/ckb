@@ -291,6 +291,7 @@ impl PoolMap {
         self.links.add_link(tx_short_id, links);
         self.insert_entry(&entry, status);
         self.track_entry_statics(None, Some(status));
+        // Preflight checked both additions; capacity trimming only reduces totals.
         self.total_tx_size += entry.size;
         self.total_tx_cycles += entry.cycles;
         Ok(Some(evictions))
@@ -868,19 +869,18 @@ impl PoolMap {
         removed: &mut HashSet<ProposalShortId>,
         max_size: usize,
     ) -> Result<HashSet<ProposalShortId>, Reject> {
-        let mut size = self.check_stat_for_add_tx(entry, removed)?;
-        let mut capacity = HashSet::new();
-        if size <= max_size {
-            return Ok(capacity);
-        }
+        let (mut retained_size, mut retained_cycles) =
+            self.check_stat_for_add_tx(entry, removed)?;
         let full = || {
             Reject::Full(format!(
                 "the fee_rate for this transaction is: {}",
                 entry.fee_rate()
             ))
         };
-        if entry.size > max_size {
-            return Err(full());
+        let retained_size_limit = max_size.checked_sub(entry.size).ok_or_else(full)?;
+        let mut capacity = HashSet::new();
+        if retained_size <= retained_size_limit {
+            return Ok(capacity);
         }
         let candidate = entry.proposal_short_id();
         let ancestors = self
@@ -947,14 +947,17 @@ impl PoolMap {
             victims.insert(root);
             victims.retain(|id| !removed.contains(id));
             for id in &victims {
-                size -= self.get_by_id_checked(id).inner.size;
+                (retained_size, retained_cycles) = Self::checked_sub_stat(
+                    (retained_size, retained_cycles),
+                    &self.get_by_id_checked(id).inner,
+                )?;
                 modified.remove(id);
                 affected.extend(self.calc_ancestors(id));
             }
             affected.extend(ancestors.iter().cloned());
             capacity.extend(victims.iter().cloned());
             removed.extend(victims);
-            if size <= max_size {
+            if retained_size <= retained_size_limit {
                 links.children.retain(|id| !removed.contains(id));
                 return Ok(capacity);
             }
@@ -1029,20 +1032,39 @@ impl PoolMap {
         )
     }
 
-    /// Check size and cycle totals before any membership mutation.
+    fn checked_sub_stat(
+        (size, cycles): (usize, Cycle),
+        entry: &TxEntry,
+    ) -> Result<(usize, Cycle), Reject> {
+        let size = size.checked_sub(entry.size).ok_or_else(|| {
+            Reject::Full(format!(
+                "tx-pool total_tx_size {} underflows when subtracting {}",
+                size, entry.size
+            ))
+        })?;
+        let cycles = cycles.checked_sub(entry.cycles).ok_or_else(|| {
+            Reject::Full(format!(
+                "tx-pool total_tx_cycles {} underflows when subtracting {}",
+                cycles, entry.cycles
+            ))
+        })?;
+        Ok((size, cycles))
+    }
+
+    /// Check removal and addition before mutation, returning retained totals.
+    /// Keep the candidate separate so it cannot hide an underflow when capacity
+    /// planning subtracts further victims. Inconsistent totals reject locally.
     fn check_stat_for_add_tx(
         &self,
         entry: &TxEntry,
         removed: &HashSet<ProposalShortId>,
-    ) -> Result<usize, Reject> {
-        let mut size = self.total_tx_size;
-        let mut cycles = self.total_tx_cycles;
+    ) -> Result<(usize, Cycle), Reject> {
+        let mut totals = (self.total_tx_size, self.total_tx_cycles);
         for id in removed {
-            let old = &self.get_by_id_checked(id).inner;
-            size -= old.size;
-            cycles -= old.cycles;
+            totals = Self::checked_sub_stat(totals, &self.get_by_id_checked(id).inner)?;
         }
-        let size = size.checked_add(entry.size).ok_or_else(|| {
+        let (size, cycles) = totals;
+        size.checked_add(entry.size).ok_or_else(|| {
             Reject::Full(format!(
                 "tx-pool total_tx_size {} overflows by add {}",
                 size, entry.size
@@ -1054,7 +1076,7 @@ impl PoolMap {
                 cycles, entry.cycles
             ))
         })?;
-        Ok(size)
+        Ok(totals)
     }
 
     /// Update size and cycles statistics for remove tx

@@ -11,6 +11,7 @@ mod proposed;
 mod recent_reject;
 mod relations;
 mod score_key;
+mod totals;
 mod transaction_hash;
 mod tx_selector;
 mod util;
