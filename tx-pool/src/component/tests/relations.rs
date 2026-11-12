@@ -314,8 +314,10 @@ fn capacity_preflight_matches_materialized_eviction_on_every_four_node_dag() {
         let entries = graph(&parents.iter().map(Vec::as_slice).collect::<Vec<_>>());
         for candidate in 0..4 {
             for mixed_status in [false, true] {
-                for replaced_root in [None, Some(0), Some(1), Some(2), Some(3)] {
-                    if replaced_root == Some(candidate) {
+                // Include every union of replacement roots, including roots
+                // whose descendant packages overlap.
+                for replaced_roots in 0..1usize << entries.len() {
+                    if replaced_roots & (1 << candidate) != 0 {
                         continue;
                     }
                     for limit in [0, 250, 500, 750, 1_000, usize::MAX] {
@@ -338,12 +340,12 @@ fn capacity_preflight_matches_materialized_eviction_on_every_four_node_dag() {
                         }
                         let before = ids(&actual);
                         let candidate_entry = &entries[candidate];
-                        let replaced: HashSet<_> = replaced_root
-                            .into_iter()
-                            .flat_map(|index| {
-                                reference.remove_entry_and_descendants(
-                                    &entries[index].proposal_short_id(),
-                                )
+                        let replaced: HashSet<_> = entries
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| replaced_roots & (1 << index) != 0)
+                            .flat_map(|(_, entry)| {
+                                reference.remove_entry_and_descendants(&entry.proposal_short_id())
                             })
                             .map(|entry| entry.proposal_short_id())
                             .collect();
@@ -382,7 +384,7 @@ fn capacity_preflight_matches_materialized_eviction_on_every_four_node_dag() {
                                 assert_eq!(
                                     ids(&actual),
                                     ids(&reference),
-                                    "mask {mask} candidate {candidate} replaced {replaced_root:?} limit {limit}"
+                                    "mask {mask} candidate {candidate} replaced {replaced_roots:b} limit {limit}"
                                 );
                                 assert_eq!(
                                     evicted
