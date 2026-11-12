@@ -60,6 +60,7 @@ impl Measurement {
                 offset_from_addr: 0,
             }],
             entry: 0,
+            phnum: 0,
         };
         let mut result = Self {
             cycles: SAMPLE_CYCLES,

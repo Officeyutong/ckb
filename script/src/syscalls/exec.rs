@@ -9,8 +9,9 @@ use ckb_types::core::cell::CellMeta;
 use ckb_types::core::error::ARGV_TOO_LONG_TEXT;
 use ckb_types::packed::{Bytes as PackedBytes, BytesVec};
 use ckb_vm::Memory;
+use ckb_vm::elf::{metadata_strict_check, parse_elf};
 use ckb_vm::memory::load_c_string_byte_by_byte;
-use ckb_vm::{DEFAULT_STACK_SIZE, RISCV_MAX_MEMORY};
+use ckb_vm::{DEFAULT_STACK_SIZE, RISCV_MAX_MEMORY, ValidationMode};
 use ckb_vm::{
     Error as VMError, Register, SupportMachine, Syscalls,
     registers::{A0, A1, A2, A3, A4, A5, A7},
@@ -19,13 +20,21 @@ use ckb_vm::{
 #[derive(Debug)]
 pub struct Exec<DL> {
     sg_data: SgData<DL>,
+    validation_mode: ValidationMode,
 }
 
 impl<DL: CellDataProvider + Clone> Exec<DL> {
     pub fn new(sg_data: &SgData<DL>) -> Exec<DL> {
         Exec {
             sg_data: sg_data.clone(),
+            validation_mode: ValidationMode::Consensus,
         }
+    }
+
+    /// Sets the validation mode used when loading the replacement program.
+    pub fn with_validation_mode(mut self, validation_mode: ValidationMode) -> Self {
+        self.validation_mode = validation_mode;
+        self
     }
 
     #[inline]
@@ -177,10 +186,19 @@ impl<Mac: SupportMachine, DL: CellDataProvider + Send + Sync + Clone> Syscalls<M
         machine.reset(max_cycles);
         machine.set_cycles(cycles);
 
-        match machine.load_elf(&data, true) {
+        let load_result = (|| {
+            // Syscalls receive the inner machine, bypassing DefaultMachine's validation.
+            if self.validation_mode == ValidationMode::Strict {
+                let metadata = parse_elf::<Mac::REG>(&data, machine.version())?;
+                metadata_strict_check(&metadata)?;
+            }
+            machine.load_elf(&data, true)
+        })();
+        match load_result {
             Ok(size) => {
                 machine.add_cycles_no_checking(transferred_byte_cycles(size))?;
             }
+            Err(error) if error.is_raised_by_strict() => return Err(error),
             Err(_) => {
                 machine.set_register(A0, Mac::REG::from_u8(WRONG_FORMAT));
                 return Ok(true);

@@ -225,6 +225,12 @@ where
         }
     }
 
+    /// Sets the validation mode for script VMs without changing cached-cycle reuse.
+    pub fn with_validation_mode(mut self, validation_mode: ckb_script::ValidationMode) -> Self {
+        self.script.inner = self.script.inner.with_validation_mode(validation_mode);
+        self
+    }
+
     /// Perform context-dependent verification.
     ///
     /// skip script verify will result in the return value cycle always is zero

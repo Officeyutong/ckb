@@ -351,7 +351,9 @@ impl TryFrom<Reject> for PoolTransactionReject {
             Reject::DeclaredWrongCycles(..) => Self::DeclaredWrongCycles(format!("{reject}")),
             Reject::Resolve(_) => Self::Resolve(format!("{reject}")),
             Reject::Verification(_) if reject.is_verification_interrupted() => return Err(reject),
-            Reject::Verification(_) => Self::Verification(format!("{reject}")),
+            Reject::Verification(_) | Reject::PoolPolicy(_) => {
+                Self::Verification(format!("{reject}"))
+            }
             Reject::Expiry(_) => Self::Expiry(format!("{reject}")),
             Reject::RBFRejected(_) => Self::RBFRejected(format!("{reject}")),
             Reject::Invalidated(_) => Self::Invalidated(format!("{reject}")),

@@ -19,3 +19,4 @@ pub use crate::types::{
 pub use crate::verify::SchedulerRunner;
 pub use crate::verify::{TransactionScriptsVerifier, VM_INTERRUPTED_MESSAGE};
 pub use crate::verify_env::TxVerifyEnv;
+pub use ckb_vm::ValidationMode;

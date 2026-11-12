@@ -58,6 +58,10 @@ pub enum Reject {
     #[error("Verification failed {0}")]
     Verification(Error),
 
+    /// Transaction violates tx-pool verification policy, not necessarily consensus.
+    #[error("Verification failed {0}")]
+    PoolPolicy(Error),
+
     /// Expired
     #[error("Expiry transaction, timestamp {0}")]
     Expiry(u64),
@@ -90,7 +94,7 @@ fn is_malformed_from_verification(error: &Error) -> bool {
 }
 
 impl Reject {
-    /// Returns true if the reject reason is malformed tx.
+    /// Returns true if the reject reason is a malformed tx, not a pool-only policy failure.
     pub fn is_malformed_tx(&self) -> bool {
         match self {
             Reject::Malformed(_, _) => true,
@@ -125,6 +129,7 @@ impl Reject {
             | Self::ExceededTransactionSizeLimit(..)
             | Self::Malformed(..)
             | Self::DeclaredWrongCycles(..)
+            | Self::PoolPolicy(..)
             | Self::Resolve(..)
             | Self::Expiry(..)
             | Self::RBFRejected(..)
