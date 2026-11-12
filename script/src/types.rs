@@ -1055,6 +1055,8 @@ where
     pub message_box: Arc<Mutex<Vec<Message>>>,
     /// A snapshot for COW usage
     pub snapshot2_context: Arc<Mutex<Snapshot2Context<DataPieceId, SgData<DL>>>>,
+    /// Validation mode inherited by VM syscalls.
+    pub validation_mode: ckb_vm::ValidationMode,
 }
 
 impl<DL> VmContext<DL>
@@ -1066,6 +1068,7 @@ where
     /// among different entities.
     pub fn new(sg_data: &SgData<DL>, message_box: &Arc<Mutex<Vec<Message>>>) -> Self {
         Self {
+            validation_mode: ckb_vm::ValidationMode::Consensus,
             base_cycles: Arc::new(AtomicU64::new(0)),
             message_box: Arc::clone(message_box),
             snapshot2_context: Arc::new(Mutex::new(Snapshot2Context::new(sg_data.clone()))),

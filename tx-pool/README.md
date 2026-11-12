@@ -32,10 +32,15 @@ Submission derives the final proposal status at commit and uses that same status
 for the block-assembler notification after releasing the pool lock. Verification
 and membership share the Pending/Gap/Proposed states; callers do not carry a
 second status into admission or publish an acceptance notification separately.
+A blocked or cancelled notification does not retain the pool lock or roll back
+committed membership; notification on this path remains best-effort.
 
 Package selection uses the maintained statistics for capacity and dependency
-ordering. A prepared package is an ordered list of unselected entries; the
-selection's membership set also excludes them from subsequent package updates.
+ordering. A prepared package keeps unselected entries and their short IDs in
+ancestor order; the selection's membership set also excludes them from subsequent
+package updates. Only remaining-capacity failures count toward the consecutive
+failure limit, and successful selection resets it. Unproposed ancestors do not
+consume that limit.
 Admission and reorg trimming share the same capacity-eviction priority. The
 [relation tests](src/component/tests/relations.rs) independently reconstruct the
 graph from transaction bodies and check statistics, indexes, and rejection paths.

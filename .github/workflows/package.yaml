@@ -15,6 +15,7 @@ on:
       - "pkg/*"
 
 env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
 
@@ -166,9 +167,20 @@ jobs:
             build_target: "prod_portable"
     steps:
       - uses: actions/checkout@v6
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CKB_VM_PRIVATE_DEPLOY_KEY }}
+      - name: Fetch build dependencies on the host
+        env:
+          CARGO_HOME: ${{ github.workspace }}/target/cargo-home
+        run: cargo fetch --locked
       - name: Build CKB and Package CKB
         run: |
-          docker run --rm -i -w /ckb -v $(pwd):/ckb $BUILDER_IMAGE make ${{ matrix.build_target }}
+          docker run --rm -i -w /ckb \
+            -v "$(pwd):/ckb" \
+            -e CARGO_HOME=/ckb/target/cargo-home \
+            -e CARGO_NET_OFFLINE=true \
+            "$BUILDER_IMAGE" make ${{ matrix.build_target }}
           devtools/ci/package.sh target/prod/ckb
           mv ${{ github.workspace }}/releases/ckb_${{env.GIT_TAG_NAME }}_${{env.REL_PKG }} ${{ github.workspace }}
       - name: Sign archive
@@ -213,6 +225,9 @@ jobs:
       )
     steps:
       - uses: actions/checkout@v6
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CKB_VM_PRIVATE_DEPLOY_KEY }}
       - name: Add rust target
         run: rustup target add aarch64-unknown-linux-gnu
       - name: Install dependencies
@@ -271,9 +286,20 @@ jobs:
             build_target: "prod_portable"
     steps:
       - uses: actions/checkout@v6
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CKB_VM_PRIVATE_DEPLOY_KEY }}
+      - name: Fetch build dependencies on the host
+        env:
+          CARGO_HOME: ${{ github.workspace }}/target/cargo-home
+        run: cargo fetch --locked
       - name: Build CKB and Package CKB
         run: |
-          docker run --rm -i -w /ckb -v $(pwd):/ckb $BUILDER_IMAGE make ${{ matrix.build_target }}
+          docker run --rm -i -w /ckb \
+            -v "$(pwd):/ckb" \
+            -e CARGO_HOME=/ckb/target/cargo-home \
+            -e CARGO_NET_OFFLINE=true \
+            "$BUILDER_IMAGE" make ${{ matrix.build_target }}
           devtools/ci/package.sh target/prod/ckb
           mv ${{ github.workspace }}/releases/ckb_${{env.GIT_TAG_NAME }}_${{env.REL_PKG }} ${{ github.workspace }}
       - name: Sign archive
@@ -325,6 +351,9 @@ jobs:
             build_target: "prod_portable"
     steps:
       - uses: actions/checkout@v6
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CKB_VM_PRIVATE_DEPLOY_KEY }}
       - name: Build CKB and Package CKB
         run: |
           make ${{ matrix.build_target }}
@@ -378,6 +407,9 @@ jobs:
           - rel_pkg: "aarch64-apple-darwin-portable.zip"
             build_target: "prod_portable"
     steps:
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CKB_VM_PRIVATE_DEPLOY_KEY }}
       - name: Setup PATH
         run: |
           echo /opt/homebrew/bin >> $GITHUB_PATH
@@ -438,6 +470,9 @@ jobs:
         contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
       )
     steps:
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CKB_VM_PRIVATE_DEPLOY_KEY }}
       - name: Install Dependencies
         run: |
           Set-ExecutionPolicy RemoteSigned -scope CurrentUser

@@ -11,6 +11,7 @@ on:
   workflow_dispatch: {}
 
 env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
   RUSTFLAGS: -D warnings
@@ -20,6 +21,9 @@ jobs:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ${{ github.repository_owner == 'nervosnetwork' && 'blacksmith-8vcpu-ubuntu-2204' || 'ubuntu-22.04' }}
     steps:
+      - uses: webfactory/ssh-agent@v0.10.0
+        with:
+          ssh-private-key: ${{ secrets.CKB_VM_PRIVATE_DEPLOY_KEY }}
       - name: Free up disk space
         if: github.repository_owner != 'nervosnetwork'
         run: |

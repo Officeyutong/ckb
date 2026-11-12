@@ -475,6 +475,64 @@ async fn submission_notifies_committed_status_without_holding_the_pool_lock() {
         receiver.try_recv().is_err(),
         "rejection must not publish acceptance"
     );
+
+    // Cancelling a caller blocked on publication cannot roll back membership
+    // or retain the pool lock. Publication remains best-effort on this path.
+    service
+        .block_assembler_sender
+        .try_send(BlockAssemblerMessage::Uncle)
+        .unwrap();
+    let cancelled = entry(91, &[], 100, 1);
+    let cancelled_id = cancelled.proposal_short_id();
+    {
+        let submit = service.submit_entry(snapshot.tip_hash(), cancelled);
+        tokio::pin!(submit);
+        assert!(poll!(&mut submit).is_pending());
+        assert!(
+            service
+                .tx_pool
+                .try_write()
+                .unwrap()
+                .pool_map
+                .get(&cancelled_id)
+                .is_some()
+        );
+    }
+    assert!(
+        service
+            .tx_pool
+            .try_write()
+            .unwrap()
+            .pool_map
+            .get(&cancelled_id)
+            .is_some()
+    );
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        BlockAssemblerMessage::Uncle
+    ));
+    assert!(receiver.try_recv().is_err());
+
+    // A closed notification endpoint also leaves the accepted result intact.
+    drop(receiver);
+    let accepted = entry(92, &[], 100, 1);
+    let accepted_id = accepted.proposal_short_id();
+    assert!(
+        service
+            .submit_entry(snapshot.tip_hash(), accepted)
+            .await
+            .0
+            .is_ok()
+    );
+    assert!(
+        service
+            .tx_pool
+            .try_write()
+            .unwrap()
+            .pool_map
+            .get(&accepted_id)
+            .is_some()
+    );
 }
 
 #[tokio::test]

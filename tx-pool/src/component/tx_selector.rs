@@ -42,8 +42,13 @@ impl MultiIndexModifiedTxMap {
     }
 }
 
-// Bound failed package attempts so selection finishes when many entries cannot fit.
-const MAX_FAILED_ATTEMPTS: usize = 4000;
+// Stop after a run of packages that cannot fit the remaining block capacity.
+const MAX_CONSECUTIVE_FAILURES: usize = 4000;
+
+enum PackageRejection {
+    Capacity,
+    UnproposedAncestor,
+}
 
 /// Selects proposed transactions together with their unselected ancestors.
 ///
@@ -83,7 +88,7 @@ impl<'a> TxSelector<'a> {
     ) -> (Vec<TxEntry>, usize, Cycle) {
         let mut size: usize = 0;
         let mut cycles: Cycle = 0;
-        let mut failed_attempts = 0;
+        let mut consecutive_failed = 0;
 
         let mut iter = self
             .pool_map
@@ -128,37 +133,44 @@ impl<'a> TxSelector<'a> {
             };
 
             let short_id = tx_entry.proposal_short_id();
-            let Some(package) =
-                self.prepare_package(tx_entry, size, cycles, size_limit, cycles_limit)
-            else {
-                if using_modified {
-                    self.modified_entries.remove(&short_id);
-                    self.failed_txs.insert(short_id);
-                }
-                failed_attempts += 1;
-                if failed_attempts > MAX_FAILED_ATTEMPTS {
-                    break;
-                }
-                continue;
-            };
+            let package =
+                match self.prepare_package(tx_entry, size, cycles, size_limit, cycles_limit) {
+                    Ok(package) => package,
+                    Err(reason) => {
+                        if using_modified {
+                            self.modified_entries.remove(&short_id);
+                            self.failed_txs.insert(short_id);
+                        }
+                        // Proposal eligibility says nothing about remaining capacity.
+                        if matches!(reason, PackageRejection::Capacity) {
+                            consecutive_failed += 1;
+                            if consecutive_failed > MAX_CONSECUTIVE_FAILURES {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                };
 
-            for entry in &package {
-                let short_id = entry.proposal_short_id();
+            for (short_id, entry) in &package {
                 let is_new = self.fetched_txs.insert(short_id.clone());
                 debug_assert!(is_new, "prepared packages contain only unselected entries");
                 cycles = cycles.saturating_add(entry.cycles);
                 size = size.saturating_add(entry.size);
-                self.modified_entries.remove(&short_id);
+                self.modified_entries.remove(short_id);
             }
 
             self.update_modified_entries(&package);
-            self.entries.extend(package);
+            self.entries
+                .extend(package.into_iter().map(|(_, entry)| entry));
+            consecutive_failed = 0;
         }
         (self.entries, size, cycles)
     }
 
     // Check cost and proposal eligibility, then return each unselected member
-    // exactly once in ancestor order, before selection mutates state.
+    // exactly once in ancestor order, before selection mutates state. Keep the
+    // prepared short IDs for selection and descendant updates to reuse.
     fn prepare_package(
         &self,
         tx_entry: TxEntry,
@@ -166,11 +178,11 @@ impl<'a> TxSelector<'a> {
         cycles: Cycle,
         size_limit: usize,
         cycles_limit: Cycle,
-    ) -> Option<Vec<TxEntry>> {
+    ) -> Result<Vec<(ProposalShortId, TxEntry)>, PackageRejection> {
         if size.saturating_add(tx_entry.ancestors_size) > size_limit
             || cycles.saturating_add(tx_entry.ancestors_cycles) > cycles_limit
         {
-            return None;
+            return Err(PackageRejection::Capacity);
         }
 
         let ancestors_ids = self.pool_map.calc_ancestors(&tx_entry.proposal_short_id());
@@ -178,7 +190,7 @@ impl<'a> TxSelector<'a> {
             .iter()
             .any(|id| !self.pool_map.has_proposed(id))
         {
-            return None;
+            return Err(PackageRejection::UnproposedAncestor);
         }
 
         let mut ancestors = ancestors_ids
@@ -189,17 +201,16 @@ impl<'a> TxSelector<'a> {
                 } else {
                     let entry = self.retrieve_entry(id);
                     debug_assert!(entry.is_some(), "pool should be consistent");
-                    entry
+                    entry.map(|entry| (id.clone(), entry.clone()))
                 }
             })
-            .cloned()
-            .collect::<Vec<TxEntry>>();
+            .collect::<Vec<_>>();
 
         // Every remaining ancestor has a strictly smaller ancestor set than
         // its descendants. Pool mutations maintain these counts on both sides.
-        ancestors.sort_unstable_by_key(|entry| entry.ancestors_count);
-        ancestors.push(tx_entry);
-        Some(ancestors)
+        ancestors.sort_unstable_by_key(|(_, entry)| entry.ancestors_count);
+        ancestors.push((tx_entry.proposal_short_id(), tx_entry));
+        Ok(ancestors)
     }
 
     fn retrieve_entry(&self, short_id: &ProposalShortId) -> Option<&TxEntry> {
@@ -220,9 +231,9 @@ impl<'a> TxSelector<'a> {
 
     /// Add descendants of given transactions to `modified_entries` with ancestor
     /// state updated assuming given transactions are inBlock.
-    fn update_modified_entries(&mut self, already_added: &[TxEntry]) {
-        for entry in already_added {
-            let descendants = self.pool_map.calc_descendants(&entry.proposal_short_id());
+    fn update_modified_entries(&mut self, already_added: &[(ProposalShortId, TxEntry)]) {
+        for (id, entry) in already_added {
+            let descendants = self.pool_map.calc_descendants(id);
             for desc_id in descendants
                 .iter()
                 .filter(|id| !self.fetched_txs.contains(id) && self.pool_map.has_proposed(id))
