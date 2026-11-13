@@ -30,27 +30,28 @@ impl Edges {
         self.deps.len()
     }
 
-    pub(crate) fn insert_input(
-        &mut self,
-        out_point: OutPoint,
-        txid: ProposalShortId,
+    pub(crate) fn check_inputs(
+        &self,
+        inputs: impl Iterator<Item = OutPoint>,
+        txid: &ProposalShortId,
+        evicted: &HashSet<ProposalShortId>,
     ) -> Result<(), Reject> {
-        // inputs is occupied means double speanding happened here
-        match self.inputs.entry(out_point.clone()) {
-            Entry::Occupied(occupied) => {
+        let mut seen = HashSet::new();
+        for out_point in inputs {
+            let previous = self
+                .inputs
+                .get(&out_point)
+                .filter(|owner| !evicted.contains(*owner))
+                .or_else(|| (!seen.insert(out_point.clone())).then_some(txid));
+            if let Some(previous) = previous {
                 let msg = format!(
                     "txpool unexpected double-spending out_point: {:?} old_tx: {:?} new_tx: {:?}",
-                    out_point,
-                    occupied.get(),
-                    txid
+                    out_point, previous, txid
                 );
-                Err(Reject::RBFRejected(msg))
-            }
-            Entry::Vacant(vacant) => {
-                vacant.insert(txid);
-                Ok(())
+                return Err(Reject::RBFRejected(msg));
             }
         }
+        Ok(())
     }
 
     pub(crate) fn remove_input(&mut self, out_point: &OutPoint) -> Option<ProposalShortId> {

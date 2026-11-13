@@ -26,7 +26,6 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::sleep;
 
 const MAX_TX_VERIFY_CYCLES: u64 = 70_000_000;
-const UNUSED_SNAPSHOT_COLUMNS: u32 = 1;
 
 #[test]
 fn verify_queue_preserves_proposal_and_relay_origin() {
@@ -369,7 +368,7 @@ fn tx_pool_config() -> TxPoolConfig {
 fn snapshot(consensus: Arc<Consensus>) -> Arc<Snapshot> {
     let tmp_dir = TempDir::new().expect("create temp dir");
     let store = ChainDB::new(
-        RocksDB::open_in(&tmp_dir, UNUSED_SNAPSHOT_COLUMNS),
+        RocksDB::open_in(&tmp_dir, ckb_db_schema::COLUMNS),
         Default::default(),
     );
     Arc::new(Snapshot::new(
@@ -410,7 +409,7 @@ fn network(consensus: &Consensus) -> ckb_network::NetworkController {
     .expect("start test network service")
 }
 
-fn service() -> TxPoolService {
+pub(super) fn service() -> TxPoolService {
     service_with_relay_receiver().0
 }
 

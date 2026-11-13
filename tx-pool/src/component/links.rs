@@ -83,6 +83,7 @@ impl TxLinksMap {
         self.calc_relative_ids(short_id, Relation::Children)
     }
 
+    #[cfg(test)]
     pub fn get_children(&self, short_id: &ProposalShortId) -> Option<&HashSet<ProposalShortId>> {
         self.inner.get(short_id).map(|link| &link.children)
     }

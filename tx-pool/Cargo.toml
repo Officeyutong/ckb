@@ -57,6 +57,7 @@ nix = { version = "0.31.2", default-features = false, features = ["time"] }
 winapi = { version = "0.3", features = ["processthreadsapi"] }
 
 [dev-dependencies]
+ckb-db-schema.workspace = true
 tempfile.workspace = true
 ckb-hash.workspace = true
 ckb-systemtime = { workspace = true, features = ["enable_faketime"] }

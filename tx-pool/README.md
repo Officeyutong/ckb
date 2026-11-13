@@ -4,6 +4,54 @@ This crate is a component of [ckb](https://github.com/nervosnetwork/ckb).
 
 CKB Tx-pool stores transactions, which is designed for CKB Two Step Transaction Confirmation mechanism
 
+## Membership and package statistics
+
+`PoolMap` derives parent links from inputs, resolved cell dependencies (including
+dep-group members), and the ordering of dependency readers before cell spenders.
+Its ancestor and descendant statistics count each reachable transaction once,
+including itself. Inserting a late parent or removing a bridge updates both sides
+of the changed relations while preserving alternative paths. Removing a whole
+descendant package updates only the ancestors that remain in the pool.
+
+Admission checks limits, cycles in the relation graph, and input conflicts against
+the surviving graph before changing membership. Replacement, reader, and capacity
+evictions form one descendant-closed removal set. They preserve the candidate's
+input and resolved dependency producers and their ancestors. Ancestor limits also
+cover retained descendants of a late parent. Capacity preflight recalculates only
+affected eviction keys, retaining the existing status and fee priorities without
+cloning or tentatively changing the pool. A rejected admission leaves membership,
+indexes, conflict history, and callbacks unchanged.
+Accounting preflight uses checked arithmetic and rejects an underflow or overflow
+before mutation. Capacity planning keeps the candidate's cost separate from the
+retained totals so it cannot conceal an underflow while subtracting victims.
+
+Submission rechecks resolved backing under the pool write lock even when the chain
+tip has not changed during verification. Replacement counts shared victims once
+and protects expanded dep-group members. Successful admission publishes removal
+and acceptance callbacks only after membership commits. Expiry removes complete
+descendant packages; proposal detachment changes status without removing entries.
+Reorg restoration enforces capacity after reinserting the detached batch.
+Submission derives the final proposal status at commit and uses that same status
+for the block-assembler notification after releasing the pool lock. Verification
+and membership share the Pending/Gap/Proposed states; callers do not carry a
+second status into admission or publish an acceptance notification separately.
+A blocked or cancelled notification does not retain the pool lock or roll back
+committed membership; notification on this path remains best-effort.
+
+Package selection uses the maintained statistics for capacity and dependency
+ordering. A prepared package keeps unselected entries and their short IDs in
+ancestor order; the selection's membership set also excludes them from subsequent
+package updates. Only remaining-capacity failures count toward the consecutive
+failure limit, and successful selection resets it. Unproposed ancestors do not
+consume that limit.
+Admission and reorg trimming share the same capacity-eviction priority. The
+[relation tests](src/component/tests/relations.rs) independently reconstruct the
+graph from transaction bodies and check statistics, indexes, and rejection paths.
+They also compare capacity preflight with materialized eviction across all
+four-node DAGs, replacement closures, proposal statuses, and size limits. The
+[admission tests](src/component/tests/admission.rs) cover submission failures,
+backing changes during verification, and post-commit callback state.
+
 ## Verification CPU budget
 
 Relay, proposal-response, network-orphan verification and `test_tx_pool_accept`

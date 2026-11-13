@@ -24,7 +24,7 @@ use ckb_types::{
     packed::{Byte32, ProposalShortId},
 };
 use lru::LruCache;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 const COMMITTED_HASH_CACHE_SIZE: usize = 100_000;
@@ -98,17 +98,13 @@ impl TxPool {
         self.calculate_min_replace_fee(&conflicts, tx.size)
     }
 
-    /// min_replace_fee = sum(replaced_txs.fee) + extra_rbf_fee
+    /// min_replace_fee = sum(replaced_txs.fee) + extra_rbf_fee.
+    /// Both callers supply a unique descendant closure, including its roots.
     fn calculate_min_replace_fee(&self, conflicts: &[&PoolEntry], size: usize) -> Option<Capacity> {
         let extra_rbf_fee = self.config.min_rbf_rate.fee(size as u64);
-        // don't account for duplicate txs
-        let replaced_fees: HashMap<_, _> = conflicts
+        let replaced_sum_fee = conflicts
             .iter()
-            .map(|c| (c.id.clone(), c.inner.fee))
-            .collect();
-        let replaced_sum_fee = replaced_fees
-            .values()
-            .try_fold(Capacity::zero(), |acc, x| acc.safe_add(*x));
+            .try_fold(Capacity::zero(), |acc, entry| acc.safe_add(entry.inner.fee));
         let res = replaced_sum_fee.map_or(Err(CapacityError::Overflow), |sum| {
             sum.safe_add(extra_rbf_fee)
         });
@@ -264,7 +260,7 @@ impl TxPool {
         }
     }
 
-    // Expire all transaction (and their dependencies) in the pool.
+    // Expire transactions together with every dependent transaction.
     pub(crate) fn remove_expired(&mut self, callbacks: &Callbacks) {
         let now_ms = ckb_systemtime::unix_time_as_millis();
 
@@ -272,35 +268,31 @@ impl TxPool {
             .pool_map
             .iter()
             .filter(|&entry| now_ms.saturating_sub(entry.inner.timestamp) > self.expiry)
-            .map(|entry| entry.inner.clone())
+            .map(|entry| entry.id.clone())
             .collect();
 
-        for entry in removed {
-            let tx_hash = entry.transaction().hash();
-            debug!("remove_expired {} timestamp({})", tx_hash, entry.timestamp);
-            self.pool_map.remove_entry(&entry.proposal_short_id());
-            let reject = Reject::Expiry(entry.timestamp);
-            callbacks.call_reject(self, &entry, reject);
+        for id in removed {
+            for entry in self.pool_map.remove_entry_and_descendants(&id) {
+                debug!(
+                    "remove_expired {} timestamp({})",
+                    entry.transaction().hash(),
+                    entry.timestamp
+                );
+                let reject = Reject::Expiry(entry.timestamp);
+                callbacks.call_reject(self, &entry, reject);
+            }
         }
     }
 
     // Remove transactions from the pool until total size <= size_limit.
-    // Return a `Reject` for current inserting entry if it's removed
-    pub(crate) fn limit_size(
-        &mut self,
-        callbacks: &Callbacks,
-        current_entry_id: Option<&ProposalShortId>,
-    ) -> Option<Reject> {
-        let mut ret = None;
+    // Used after chain reconciliation; ordinary admission plans this before mutation.
+    pub(crate) fn limit_size(&mut self, callbacks: &Callbacks) {
         while self.pool_map.total_tx_size > self.config.max_tx_pool_size {
-            let next_evict_entry = || {
-                self.pool_map
-                    .next_evict_entry(Status::Pending)
-                    .or_else(|| self.pool_map.next_evict_entry(Status::Gap))
-                    .or_else(|| self.pool_map.next_evict_entry(Status::Proposed))
-            };
-
-            if let Some(id) = next_evict_entry() {
+            if let Some(id) = self
+                .pool_map
+                .next_evict_entry(|_| true)
+                .map(|entry| entry.id.clone())
+            {
                 let removed = self.pool_map.remove_entry_and_descendants(&id);
                 for entry in removed {
                     let tx_hash = entry.transaction().hash();
@@ -312,21 +304,14 @@ impl TxPool {
                         "the fee_rate for this transaction is: {}",
                         entry.fee_rate()
                     ));
-                    if let Some(short_id) = current_entry_id
-                        && entry.proposal_short_id() == *short_id
-                    {
-                        ret = Some(reject.clone());
-                    }
                     callbacks.call_reject(self, &entry, reject);
                 }
             }
         }
         self.pool_map.entries.shrink_to_fit();
-        ret
     }
 
-    // remove transaction with detached proposal from gap and proposed
-    // try re-put to pending
+    // Proposal detachment changes status, not membership or dependency links.
     pub(crate) fn remove_by_detached_proposal<'a>(
         &mut self,
         ids: impl Iterator<Item = &'a ProposalShortId>,
@@ -337,16 +322,10 @@ impl TxPool {
                 if status == Status::Pending {
                     continue;
                 }
-                let mut entries = self.pool_map.remove_entry_and_descendants(id);
-                entries.sort_unstable_by_key(|entry| entry.ancestors_count);
-                for mut entry in entries {
-                    let tx_hash = entry.transaction().hash();
-                    entry.reset_statistic_state();
-                    let ret = self.add_pending(entry);
-                    debug!(
-                        "remove_by_detached_proposal from {:?} {} add_pending {:?}",
-                        status, tx_hash, ret
-                    );
+                let mut affected = self.pool_map.calc_descendants(id);
+                affected.insert(id.clone());
+                for id in affected {
+                    self.pool_map.set_entry(&id, Status::Pending);
                 }
             }
         }
@@ -359,9 +338,13 @@ impl TxPool {
         !entries.is_empty()
     }
 
-    pub(crate) fn check_rtx_from_pool(&self, rtx: &ResolvedTransaction) -> Result<(), Reject> {
+    pub(crate) fn check_rtx_from_pool(
+        &self,
+        rtx: &ResolvedTransaction,
+        removed: &HashSet<ProposalShortId>,
+    ) -> Result<(), Reject> {
         let snapshot = self.snapshot();
-        let pool_cell = PoolCell::new(&self.pool_map, false);
+        let pool_cell = PoolCell::after_removal(&self.pool_map, removed);
         let checker = OverlayCellChecker::new(&pool_cell, snapshot);
         let mut seen_inputs = HashSet::new();
         rtx.check(&mut seen_inputs, &checker, snapshot)
@@ -583,8 +566,6 @@ impl TxPool {
             return Ok(HashSet::new());
         }
 
-        let short_id = entry.proposal_short_id();
-
         // Rule #1, the node has enabled RBF, which is checked by caller
         let conflicts = conflict_ids
             .iter()
@@ -609,53 +590,37 @@ impl TxPool {
 
         // Rule #5, the replaced tx's descendants can not more than 100
         // and the ancestor of the new tx don't have common set with the replaced tx's descendants
-        let mut replace_count: usize = 0;
-        let mut all_conflicted = conflicts.clone();
-        let ancestors = self.pool_map.calc_ancestors(&short_id);
-        for conflict in conflicts.iter() {
-            let descendants = self.pool_map.calc_descendants(&conflict.id);
-            replace_count += descendants.len() + 1;
-            if replace_count > MAX_REPLACEMENT_CANDIDATES {
-                return Err(Reject::RBFRejected(format!(
-                    "Tx conflict with too many txs, conflict txs count: {}, expect <= {}",
-                    replace_count, MAX_REPLACEMENT_CANDIDATES,
-                )));
-            }
-
-            if !descendants.is_disjoint(&ancestors) {
-                return Err(Reject::RBFRejected(
-                    "Tx ancestors have common with conflict Tx descendants".to_string(),
-                ));
-            }
-
-            let entries = descendants
-                .iter()
-                .filter_map(|id| self.get_pool_entry(id))
-                .collect::<Vec<_>>();
-
-            for entry in entries.iter() {
-                let hash = entry.inner.transaction().hash();
-                if tx_inputs.iter().any(|pt| pt.tx_hash() == hash) {
-                    return Err(Reject::RBFRejected(
-                        "new Tx contains inputs in descendants of to be replaced Tx".to_string(),
-                    ));
-                }
-            }
-            all_conflicted.extend(entries);
+        let replaced = self
+            .pool_map
+            .links
+            .calc_relation_ids(conflict_ids, crate::component::links::Relation::Children);
+        if replaced.len() > MAX_REPLACEMENT_CANDIDATES {
+            return Err(Reject::RBFRejected(format!(
+                "Tx conflict with too many txs, conflict txs count: {}, expect <= {}",
+                replaced.len(),
+                MAX_REPLACEMENT_CANDIDATES,
+            )));
         }
-
-        let tx_cells_deps: Vec<OutPoint> = entry
-            .transaction()
-            .cell_deps_iter()
-            .map(|c| c.out_point())
+        let all_conflicted: Vec<_> = replaced
+            .iter()
+            .filter_map(|id| self.get_pool_entry(id))
             .collect();
         for entry in all_conflicted.iter() {
             let hash = entry.inner.transaction().hash();
-            if tx_cells_deps.iter().any(|pt| pt.tx_hash() == hash) {
+            if tx_inputs.iter().any(|pt| pt.tx_hash() == hash) {
                 return Err(Reject::RBFRejected(
-                    "new Tx contains cell deps from conflicts".to_string(),
+                    "new Tx contains inputs in descendants of to be replaced Tx".to_string(),
                 ));
             }
+        }
+        if entry.related_dep_out_points().any(|point| {
+            self.pool_map
+                .get_by_tx_hash(&point.tx_hash())
+                .is_some_and(|producer| replaced.contains(&producer.id))
+        }) {
+            return Err(Reject::RBFRejected(
+                "new Tx contains cell deps from conflicts".to_string(),
+            ));
         }
 
         // Rule #4, new tx's fee need to higher than min_rbf_fee computed from the tx_pool configuration
@@ -674,7 +639,7 @@ impl TxPool {
             ));
         }
 
-        Ok(conflict_ids)
+        Ok(replaced)
     }
 
     /// query the details of a transaction in the pool, only for trouble shooting

@@ -3,6 +3,7 @@ use crate::component::tests::util::{
     DEFAULT_MAX_ANCESTORS_COUNT, MOCK_CYCLES, MOCK_FEE, MOCK_SIZE, build_tx, build_tx_with_dep,
     build_tx_with_header_dep,
 };
+use crate::error::Reject;
 use ckb_types::H256;
 use ckb_types::core::{ScriptHashType, capacity_bytes};
 use ckb_types::packed::{CellOutputBuilder, OutPointVec, ScriptBuilder};
@@ -696,75 +697,14 @@ fn test_max_ancestors_with_dep() {
 }
 
 #[test]
-fn test_max_ancestors_evicts_stale_parent_descendant() {
+fn test_max_ancestors_cannot_evict_a_required_parent() {
     let mut pool = PoolMap::new(2);
     let dep_hash: Byte32 = h256!("0x1").into();
-
     let tx1 = build_tx_with_dep(vec![(&Byte32::zero(), 0)], vec![(&dep_hash, 0)], 1);
     let tx1_id = tx1.proposal_short_id();
-    let tx1_hash = tx1.hash();
-
-    let tx2 = build_tx(vec![(&tx1_hash, 0)], 1);
+    let tx2 = build_tx(vec![(&tx1.hash(), 0)], 1);
     let tx2_id = tx2.proposal_short_id();
-    let tx2_hash = tx2.hash();
-
-    let tx3 = build_tx(vec![(&dep_hash, 0), (&tx2_hash, 0)], 1);
-    let tx3_id = tx3.proposal_short_id();
-
-    pool.add_proposed(TxEntry::new(
-        dummy_resolve(tx1, |_| None),
-        MOCK_CYCLES,
-        MOCK_FEE,
-        MOCK_SIZE,
-    ))
-    .unwrap();
-    pool.add_proposed(TxEntry::dummy_resolve(
-        tx2,
-        MOCK_CYCLES,
-        MOCK_FEE,
-        MOCK_SIZE,
-    ))
-    .unwrap();
-
-    let (inserted, evicted) = pool
-        .add_entry(
-            TxEntry::dummy_resolve(tx3, MOCK_CYCLES, MOCK_FEE, MOCK_SIZE),
-            Status::Proposed,
-        )
-        .unwrap();
-    assert!(inserted);
-
-    let evicted_ids: HashSet<_> = evicted
-        .iter()
-        .map(|entry| entry.proposal_short_id())
-        .collect();
-    assert_eq!(evicted_ids.len(), 2);
-    assert!(evicted_ids.contains(&tx1_id));
-    assert!(evicted_ids.contains(&tx2_id));
-    assert!(pool.get(&tx1_id).is_none());
-    assert!(pool.get(&tx2_id).is_none());
-    assert!(pool.get(&tx3_id).is_some());
-    assert!(pool.calc_ancestors(&tx3_id).is_empty());
-}
-
-fn assert_total_stat_consistent(pool: &PoolMap) {
-    let (size, cycles) = pool.iter().fold((0usize, 0u64), |(size, cycles), entry| {
-        (size + entry.inner.size, cycles + entry.inner.cycles)
-    });
-    assert_eq!(pool.total_tx_size, size);
-    assert_eq!(pool.total_tx_cycles, cycles);
-}
-
-#[test]
-fn test_max_ancestors_evicts_keeps_total_stat_consistent() {
-    let mut pool = PoolMap::new(2);
-    let dep_hash: Byte32 = h256!("0x1").into();
-
-    let tx1 = build_tx_with_dep(vec![(&Byte32::zero(), 0)], vec![(&dep_hash, 0)], 1);
-    let tx1_hash = tx1.hash();
-    let tx2 = build_tx(vec![(&tx1_hash, 0)], 1);
-    let tx2_hash = tx2.hash();
-    let tx3 = build_tx(vec![(&dep_hash, 0), (&tx2_hash, 0)], 1);
+    let tx3 = build_tx(vec![(&dep_hash, 0), (&tx2.hash(), 0)], 1);
     let tx3_id = tx3.proposal_short_id();
 
     pool.add_proposed(TxEntry::new(
@@ -776,25 +716,32 @@ fn test_max_ancestors_evicts_keeps_total_stat_consistent() {
     .unwrap();
     pool.add_proposed(TxEntry::dummy_resolve(tx2, 200, MOCK_FEE, 2000))
         .unwrap();
-    assert_total_stat_consistent(&pool);
+    super::relations::assert_consistent(&pool);
 
-    // tx3 consumes the cell referenced by tx1, so tx1 and its descendant tx2 are evicted
-    let (inserted, evicted) = pool
-        .add_entry(
+    // tx3 needs tx2's output: removing tx1 and tx2 cannot make it admissible.
+    assert!(matches!(
+        pool.add_entry(
             TxEntry::dummy_resolve(tx3, 400, MOCK_FEE, 4000),
             Status::Proposed,
-        )
-        .unwrap();
-    assert!(inserted);
-    assert_eq!(evicted.len(), 2);
-    assert_eq!(pool.size(), 1);
-    assert_eq!(pool.total_tx_size, 4000);
-    assert_eq!(pool.total_tx_cycles, 400);
-    assert_total_stat_consistent(&pool);
+        ),
+        Err(Reject::ExceededMaximumAncestorsCount)
+    ));
+    assert_eq!(pool.size(), 2);
+    assert!(pool.get(&tx1_id).is_some());
+    assert!(pool.get(&tx2_id).is_some());
+    assert!(pool.get(&tx3_id).is_none());
+    assert_eq!(
+        pool.calc_ancestors(&tx2_id),
+        HashSet::from([tx1_id.clone()])
+    );
+    assert_eq!(pool.total_tx_size, 3000);
+    assert_eq!(pool.total_tx_cycles, 300);
+    super::relations::assert_consistent(&pool);
 
-    pool.remove_entry(&tx3_id);
+    pool.remove_entry_and_descendants(&tx1_id);
     assert_eq!(pool.total_tx_size, 0);
     assert_eq!(pool.total_tx_cycles, 0);
+    super::relations::assert_consistent(&pool);
 }
 
 #[test]

@@ -1,9 +1,7 @@
 extern crate slab;
 use crate::component::pool_map::PoolMap;
 use crate::component::{entry::TxEntry, sort_key::AncestorsScoreSortKey};
-use ckb_logger::debug;
 use ckb_types::{core::Cycle, packed::ProposalShortId};
-use ckb_util::LinkedHashMap;
 use multi_index_map::MultiIndexMap;
 use std::collections::HashSet;
 
@@ -44,32 +42,21 @@ impl MultiIndexModifiedTxMap {
     }
 }
 
-// Limit the number of attempts to add transactions to the block when it is
-// close to full; this is just a simple heuristic to finish quickly if the
-// mempool has a lot of entries.
+// Stop after a run of packages that cannot fit the remaining block capacity.
 const MAX_CONSECUTIVE_FAILURES: usize = 4000;
 
-/// Selects transactions for inclusion in a block-template using **package-aware** fee-rate sorting.
+enum PackageRejection {
+    Capacity,
+    UnproposedAncestor,
+}
+
+/// Selects proposed transactions together with their unselected ancestors.
 ///
-/// ### Package definition
-/// A package is a connected group of ≤ MAX_ANCESTORS_COUNT（1_000）transactions
-/// The mempool is linearly ordered into non-overlapping packages using a greedy clustering
-/// algorithm that maximizes total fee for a given size and cycles.
-///
-/// ### Why packages instead of individual transactions?
-/// - A high-fee child transaction is worthless without its low-fee parent(s) (CPFP).
-/// - A low-fee parent with many high-fee children should be prioritized as a unit (package).
-/// - Sorting individual txs breaks incentive compatibility and leads to suboptimal templates.
-///
-/// ### Sorting rule
-/// Packages are sorted by **package fee rate** = total fee / total weight of the entire package.
-///
-/// ### Selection process
-// This is accomplished by walking the descendants of selected
-// transactions and storing a temporary modified state in `modified_entries``.
-// Each time through the loop, we compare the best transaction in
-// `modified_entries` with the next transaction in the tx-pool to decide what
-// transaction package to work on next.
+/// The pool index ranks each entry by its own and its ancestor package's fee
+/// rate. Selecting ancestors changes the remaining package, so affected
+/// descendants use `modified_entries` until selected. Each iteration compares
+/// the best modified entry with the next unchanged entry, then checks the
+/// complete package's proposal eligibility and remaining size/cycle budget.
 pub struct TxSelector<'a> {
     pool_map: &'a PoolMap,
     entries: Vec<TxEntry>,
@@ -146,80 +133,84 @@ impl<'a> TxSelector<'a> {
             };
 
             let short_id = tx_entry.proposal_short_id();
-            let next_size = size.saturating_add(tx_entry.ancestors_size);
-            let next_cycles = cycles.saturating_add(tx_entry.ancestors_cycles);
+            let package =
+                match self.prepare_package(tx_entry, size, cycles, size_limit, cycles_limit) {
+                    Ok(package) => package,
+                    Err(reason) => {
+                        if using_modified {
+                            self.modified_entries.remove(&short_id);
+                            self.failed_txs.insert(short_id);
+                        }
+                        // Proposal eligibility says nothing about remaining capacity.
+                        if matches!(reason, PackageRejection::Capacity) {
+                            consecutive_failed += 1;
+                            if consecutive_failed > MAX_CONSECUTIVE_FAILURES {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                };
 
-            if next_cycles > cycles_limit || next_size > size_limit {
-                consecutive_failed += 1;
-                if using_modified {
-                    self.modified_entries.remove(&short_id);
-                    self.failed_txs.insert(short_id.clone());
-                }
-                if consecutive_failed > MAX_CONSECUTIVE_FAILURES {
-                    break;
-                }
-                continue;
-            }
-
-            let only_unconfirmed = |short_id| {
-                if self.fetched_txs.contains(short_id) {
-                    None
-                } else {
-                    let entry = self.retrieve_entry(short_id);
-                    debug_assert!(entry.is_some(), "pool should be consistent");
-                    entry
-                }
-            };
-
-            // prepare to package tx with ancestors
-            let ancestors_ids = self.pool_map.calc_ancestors(&short_id);
-            // An entry with a non-proposed ancestor says nothing about how full the block is,
-            // so it is not counted in `consecutive_failed`. Otherwise such entries ranked above
-            // valid ones could end the selection early.
-            if ancestors_ids
-                .iter()
-                .any(|id| !self.pool_map.has_proposed(id))
-            {
-                if using_modified {
-                    self.modified_entries.remove(&short_id);
-                    self.failed_txs.insert(short_id.clone());
-                }
-                continue;
-            }
-
-            let mut ancestors = ancestors_ids
-                .iter()
-                .filter_map(only_unconfirmed)
-                .cloned()
-                .collect::<Vec<TxEntry>>();
-
-            // sort ancestors by ancestors_count,
-            // if A is an ancestor of B, B.ancestors_count must large than A
-            ancestors.sort_unstable_by_key(|entry| entry.ancestors_count);
-            ancestors.push(tx_entry.to_owned());
-
-            let ancestors: LinkedHashMap<ProposalShortId, TxEntry> = ancestors
-                .into_iter()
-                .map(|entry| (entry.proposal_short_id(), entry))
-                .collect();
-
-            for (short_id, entry) in &ancestors {
+            for (short_id, entry) in &package {
                 let is_new = self.fetched_txs.insert(short_id.clone());
-                if !is_new {
-                    debug!("package duplicate txs {}", short_id);
-                    continue;
-                }
+                debug_assert!(is_new, "prepared packages contain only unselected entries");
                 cycles = cycles.saturating_add(entry.cycles);
                 size = size.saturating_add(entry.size);
-                self.entries.push(entry.to_owned());
-                // try remove from modified
                 self.modified_entries.remove(short_id);
             }
 
-            self.update_modified_entries(&ancestors);
+            self.update_modified_entries(&package);
+            self.entries
+                .extend(package.into_iter().map(|(_, entry)| entry));
             consecutive_failed = 0;
         }
         (self.entries, size, cycles)
+    }
+
+    // Check cost and proposal eligibility, then return each unselected member
+    // exactly once in ancestor order, before selection mutates state. Keep the
+    // prepared short IDs for selection and descendant updates to reuse.
+    fn prepare_package(
+        &self,
+        tx_entry: TxEntry,
+        size: usize,
+        cycles: Cycle,
+        size_limit: usize,
+        cycles_limit: Cycle,
+    ) -> Result<Vec<(ProposalShortId, TxEntry)>, PackageRejection> {
+        if size.saturating_add(tx_entry.ancestors_size) > size_limit
+            || cycles.saturating_add(tx_entry.ancestors_cycles) > cycles_limit
+        {
+            return Err(PackageRejection::Capacity);
+        }
+
+        let ancestors_ids = self.pool_map.calc_ancestors(&tx_entry.proposal_short_id());
+        if ancestors_ids
+            .iter()
+            .any(|id| !self.pool_map.has_proposed(id))
+        {
+            return Err(PackageRejection::UnproposedAncestor);
+        }
+
+        let mut ancestors = ancestors_ids
+            .iter()
+            .filter_map(|id| {
+                if self.fetched_txs.contains(id) {
+                    None
+                } else {
+                    let entry = self.retrieve_entry(id);
+                    debug_assert!(entry.is_some(), "pool should be consistent");
+                    entry.map(|entry| (id.clone(), entry.clone()))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        // Every remaining ancestor has a strictly smaller ancestor set than
+        // its descendants. Pool mutations maintain these counts on both sides.
+        ancestors.sort_unstable_by_key(|(_, entry)| entry.ancestors_count);
+        ancestors.push((tx_entry.proposal_short_id(), tx_entry));
+        Ok(ancestors)
     }
 
     fn retrieve_entry(&self, short_id: &ProposalShortId) -> Option<&TxEntry> {
@@ -240,15 +231,13 @@ impl<'a> TxSelector<'a> {
 
     /// Add descendants of given transactions to `modified_entries` with ancestor
     /// state updated assuming given transactions are inBlock.
-    fn update_modified_entries(&mut self, already_added: &LinkedHashMap<ProposalShortId, TxEntry>) {
+    fn update_modified_entries(&mut self, already_added: &[(ProposalShortId, TxEntry)]) {
         for (id, entry) in already_added {
             let descendants = self.pool_map.calc_descendants(id);
             for desc_id in descendants
                 .iter()
-                .filter(|id| !already_added.contains_key(id) && self.pool_map.has_proposed(id))
+                .filter(|id| !self.fetched_txs.contains(id) && self.pool_map.has_proposed(id))
             {
-                // Note: since https://github.com/nervosnetwork/ckb/pull/3706
-                // calc_descendants() may not consistent
                 if let Some(mut desc) = self
                     .modified_entries
                     .remove(desc_id)
