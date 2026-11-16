@@ -136,6 +136,16 @@ impl<'a> ConnectionRequestProcess<'a> {
         if content.route.len() > MAX_HOPS as usize {
             return StatusCode::InvalidRoute.with_context("the route length is too long");
         }
+        // route.len() + max_hops is invariant under forwarding: a request
+        // starts with an empty route and at most MAX_HOPS remaining hops, and
+        // each forward appends one route entry while decrementing max_hops.
+        // A message violating this would make a forwarder append itself and
+        // exceed MAX_HOPS downstream, so the downstream peer would ban the
+        // forwarder instead of the original sender.
+        if content.route.len() + content.max_hops as usize > MAX_HOPS as usize {
+            return StatusCode::InvalidRoute
+                .with_context("the route length plus remaining hops exceeds MAX_HOPS");
+        }
 
         let self_peer_id = self.protocol.network_state.local_peer_id().clone();
         if content.route.contains(&self_peer_id) {
@@ -157,6 +167,11 @@ impl<'a> ConnectionRequestProcess<'a> {
             self.respond_delivered(content.from, &content.to, content.listen_addrs)
                 .await
         } else if content.max_hops == 0u8 {
+            StatusCode::ReachedMaxHops.into()
+        } else if content.route.len() >= MAX_HOPS as usize {
+            // Unreachable after the invariant check above; keep a forwarder
+            // from emitting an over-limit route if that check regresses.
+            // `ReachedMaxHops` is 5xx, so an upstream honest peer is not banned.
             StatusCode::ReachedMaxHops.into()
         } else {
             self.forward_message(&self_peer_id, &content.to).await
@@ -479,5 +494,107 @@ mod tests {
                 .pending_delivered
                 .contains_key(&forged_from)
         );
+    }
+
+    fn route_ending_with(peer: &PeerId, len: usize) -> packed::BytesVec {
+        assert!(len >= 1);
+        let mut route = packed::BytesVec::new_builder();
+        for _ in 0..(len - 1) {
+            route = route.push(PeerId::random().as_bytes());
+        }
+        route.push(peer.as_bytes()).build()
+    }
+
+    fn request_with_route(
+        from: &PeerId,
+        to: &PeerId,
+        max_hops: u8,
+        route: packed::BytesVec,
+    ) -> packed::ConnectionRequest {
+        packed::ConnectionRequest::new_builder()
+            .from(from.as_bytes())
+            .to(to.as_bytes())
+            .max_hops(max_hops)
+            .listen_addrs(listen_addrs_without_peer_id())
+            .route(route)
+            .build()
+    }
+
+    async fn execute_request(
+        context: &mut TestContext,
+        request: &packed::ConnectionRequest,
+    ) -> Status {
+        ConnectionRequestProcess::new(
+            request.as_reader(),
+            &mut context.protocol,
+            context.session_id,
+            &context.p2p_control,
+            0,
+        )
+        .execute()
+        .await
+    }
+
+    // A 6-entry route plus 6 remaining hops would become 7 entries after the
+    // forwarder appends itself, so the downstream peer would ban the forwarder
+    // with InvalidRoute(413).
+    #[tokio::test]
+    async fn rejects_route_plus_remaining_hops_over_max() {
+        let authenticated_peer = PeerId::random();
+        let mut context = build_test_context(&authenticated_peer);
+
+        let route = route_ending_with(&authenticated_peer, MAX_HOPS as usize);
+        let request = request_with_route(&authenticated_peer, &PeerId::random(), MAX_HOPS, route);
+
+        let status = execute_request(&mut context, &request).await;
+
+        assert_eq!(status.code(), StatusCode::InvalidRoute);
+        assert_eq!(status.should_ban(), Some(BAD_MESSAGE_BAN_TIME));
+    }
+
+    // A 5-entry route plus 6 remaining hops would only exceed MAX_HOPS after
+    // two forwards; reject it at the first hop instead of letting the second
+    // honest forwarder be banned.
+    #[tokio::test]
+    async fn rejects_route_that_would_exceed_max_after_forwarding() {
+        let authenticated_peer = PeerId::random();
+        let mut context = build_test_context(&authenticated_peer);
+
+        let route = route_ending_with(&authenticated_peer, MAX_HOPS as usize - 1);
+        let request = request_with_route(&authenticated_peer, &PeerId::random(), MAX_HOPS, route);
+
+        let status = execute_request(&mut context, &request).await;
+
+        assert_eq!(status.code(), StatusCode::InvalidRoute);
+        assert_eq!(status.should_ban(), Some(BAD_MESSAGE_BAN_TIME));
+    }
+
+    #[tokio::test]
+    async fn accepts_route_at_max_with_no_remaining_hops() {
+        let authenticated_peer = PeerId::random();
+        let mut context = build_test_context(&authenticated_peer);
+        let local_peer = context.network_state.local_peer_id().clone();
+
+        let route = route_ending_with(&authenticated_peer, MAX_HOPS as usize);
+        let request = request_with_route(&authenticated_peer, &local_peer, 0, route);
+
+        let status = execute_request(&mut context, &request).await;
+
+        assert_ne!(status.code(), StatusCode::InvalidRoute);
+        assert_eq!(status.should_ban(), None);
+    }
+
+    #[tokio::test]
+    async fn accepts_valid_forward_route() {
+        let authenticated_peer = PeerId::random();
+        let mut context = build_test_context(&authenticated_peer);
+
+        let route = route_ending_with(&authenticated_peer, MAX_HOPS as usize - 1);
+        let request = request_with_route(&authenticated_peer, &PeerId::random(), 1, route);
+
+        let status = execute_request(&mut context, &request).await;
+
+        assert_ne!(status.code(), StatusCode::InvalidRoute);
+        assert_eq!(status.should_ban(), None);
     }
 }
