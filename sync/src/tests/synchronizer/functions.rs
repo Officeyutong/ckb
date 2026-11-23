@@ -11,6 +11,7 @@ use ckb_network::{
     async_trait, bytes::Bytes,
 };
 use ckb_reward_calculator::RewardCalculator;
+use ckb_shared::block_status::BlockStatus;
 use ckb_shared::types::HeaderIndex;
 use ckb_shared::{Shared, SharedBuilder, Snapshot};
 use ckb_store::ChainStore;
@@ -1428,4 +1429,83 @@ fn test_internal_db_error() {
         .blocking_insert_new_block(&synchronizer.chain, Arc::clone(&block));
 
     assert!(is_internal_db_error(&status.err().unwrap()));
+}
+
+// A peer must not get a block known to be invalid requested again: neither the block fetcher
+// nor a re-announced header may bring it back into the download.
+#[test]
+fn known_invalid_block_is_not_requested_again() {
+    let (headers, invalid_hash) = {
+        let (chain, shared, _) = start_chain(Some(Consensus::default()));
+        for number in 1..=4 {
+            insert_block(
+                chain.chain_controller(),
+                &shared,
+                u128::from(number),
+                number,
+            );
+        }
+        let snapshot = shared.snapshot();
+        let headers = (1..=4)
+            .map(|number| {
+                snapshot
+                    .get_block_header(&snapshot.get_block_hash(number).unwrap())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let invalid_hash = headers[3].hash();
+        (headers, invalid_hash)
+    };
+
+    let (_chain, shared, synchronizer) = start_chain(Some(Consensus::default()));
+    let nc = Arc::new(mock_network_context(2)) as Arc<dyn CKBProtocolContext + Sync + 'static>;
+    let announcer: PeerIndex = 0.into();
+    let reannouncer: PeerIndex = 1.into();
+    synchronizer.on_connected(nc.as_ref(), announcer);
+    synchronizer.on_connected(nc.as_ref(), reannouncer);
+
+    let sendheaders = SendHeadersBuilder::default()
+        .headers(
+            headers
+                .iter()
+                .map(|header| header.data())
+                .collect::<Vec<_>>(),
+        )
+        .build();
+    assert!(
+        HeadersProcess::new(sendheaders.as_reader(), &synchronizer, announcer, &nc)
+            .execute()
+            .is_ok()
+    );
+    let peers = synchronizer.shared.state().peers();
+    assert_eq!(
+        peers.get_best_known_header(announcer).map(|h| h.hash()),
+        Some(invalid_hash.clone())
+    );
+
+    // The body of the best known block failed verification.
+    shared.insert_block_status(invalid_hash.clone(), BlockStatus::BLOCK_INVALID);
+
+    let fetched = BlockFetcher::new(Arc::clone(&synchronizer.shared), announcer, IBDState::In)
+        .fetch(BlockNumber::MAX)
+        .unwrap_or_default()
+        .concat();
+    assert!(
+        !fetched.is_empty(),
+        "the valid ancestors are still requested"
+    );
+    assert!(
+        !fetched.contains(&invalid_hash),
+        "the known invalid block must not be requested"
+    );
+
+    // Another peer announcing the known invalid header is not punished, but the header does
+    // not become its best known header.
+    let sendheaders = SendHeadersBuilder::default()
+        .headers(vec![headers[3].data()])
+        .build();
+    let status =
+        HeadersProcess::new(sendheaders.as_reader(), &synchronizer, reannouncer, &nc).execute();
+    assert!(status.is_ok(), "{status:?}");
+    assert_eq!(peers.get_best_known_header(reannouncer), None);
 }

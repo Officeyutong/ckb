@@ -268,6 +268,9 @@ impl BlockFetcher {
                     break;
                 } else if status.contains(BlockStatus::BLOCK_RECEIVED) {
                     // Do not download repeatedly
+                } else if status.contains(BlockStatus::BLOCK_INVALID) {
+                    // Do not download a block known to be invalid, its body would be
+                    // dropped without verification when received.
                 } else if (matches!(self.ibd, IBDState::In)
                     || state.compare_with_pending_compact(&hash, now))
                     && state

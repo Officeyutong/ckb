@@ -290,9 +290,20 @@ impl<'a, DL: HeaderFieldsProvider> HeaderAcceptor<'a, DL> {
         let state = self.active_chain.state();
         let shared = sync_shared.shared();
 
-        // FIXME If status == BLOCK_INVALID then return early. But which error
-        // type should we return?
         let status = self.active_chain.get_block_status(&self.header.hash());
+        // A header of a block known to be invalid must not refresh the peer's best known
+        // header, otherwise the block fetcher keeps requesting the block from this peer.
+        // The peer is not punished: the status is also set when a received body fails
+        // verification, which is not necessarily caused by the header.
+        if status.contains(BlockStatus::BLOCK_INVALID) {
+            debug!(
+                "HeadersProcess ignored known invalid header: {} {}",
+                self.header.number(),
+                self.header.hash(),
+            );
+            result.temporary_invalid(Some(ValidationError::KnownInvalid));
+            return result;
+        }
         if status.contains(BlockStatus::HEADER_VALID) {
             match sync_shared.get_header_index_view(
                 &self.header.hash(),
@@ -371,6 +382,7 @@ pub enum ValidationState {
 pub enum ValidationError {
     Verify(Error),
     InvalidParent,
+    KnownInvalid,
 }
 
 #[derive(Debug, Default)]
